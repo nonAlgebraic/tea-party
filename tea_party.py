@@ -545,4 +545,7 @@ if __name__ == "__main__":
         print("Set apiToken in config.json or OPENROUTER_API_KEY env var.")
         sys.exit(1)
     app = TeaParty()
-    app.run()
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
