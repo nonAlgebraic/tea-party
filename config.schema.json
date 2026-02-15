@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/2020-12/schema#",
+  "title": "Tea Party Configuration",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional path or URL to this schema for editor validation."
+    },
+    "apiToken": {
+      "type": "string",
+      "minLength": 1,
+      "description": "OpenRouter API token. Overrides OPENROUTER_API_KEY env var."
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 2,
+      "description": "List of OpenRouter model IDs. The human participant is always included automatically — do not add 'human' here."
+    }
+  },
+  "required": ["models"],
+  "additionalProperties": false
+}

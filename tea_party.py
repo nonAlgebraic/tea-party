@@ -4,6 +4,10 @@ import os
 import sys
 import random
 import threading
+import queue
+import time
+from pathlib import Path
+import json5
 from openai import OpenAI
 from rich.text import Text
 
@@ -14,19 +18,34 @@ from textual.containers import VerticalScroll
 from textual.widgets import Footer, Input, Static
 from textual.worker import get_current_worker
 
-# ── Models ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 HUMAN = "human"
 
-MODELS = [
-    "openai/gpt-5.2-pro",
-    "anthropic/claude-opus-4.6",
-    "google/gemini-3-pro-preview",
-    "z-ai/glm-5",
-    "meta-llama/llama-4-maverick",
-    "mistralai/mistral-large-2512",
-    "x-ai/grok-4",
-    HUMAN,
-]
+CONFIG_DIR = Path(__file__).parent
+
+
+def _load_config() -> dict:
+    for name in ("config.json5", "config.json"):
+        path = CONFIG_DIR / name
+        if path.exists():
+            with open(path) as f:
+                return json5.load(f)
+    return {}
+
+
+_config = _load_config()
+
+if "models" not in _config:
+    print("config.json must contain a 'models' array.")
+    sys.exit(1)
+
+MODELS: list[str] = [m for m in _config["models"] if m != HUMAN] + [HUMAN]
+
+OPENROUTER_API_KEY: str = (
+    _config.get("apiToken")
+    or os.environ.get("OPENROUTER_API_KEY")
+    or ""
+)
 
 MODEL_COLORS = [
     "bright_cyan",
@@ -41,13 +60,16 @@ MODEL_COLORS = [
     "cornflower_blue",
 ]
 
-# ── Config ────────────────────────────────────────────────────────────────────
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OPENROUTER_API_KEY,
 )
+
+# Speed presets: tokens per second (None = no limit, 0 = frozen)
+SPEED_MIN = 3
+SPEED_MAX = 500
+SPEED_DEFAULT = None
+SPEED_FACTOR = 1.5
 
 
 def short_name(model_id: str) -> str:
@@ -114,7 +136,7 @@ class TeaParty(App):
         Binding("space", "toggle_pause", "Pause/Resume", show=True),
         Binding("ctrl+n", "interrupt", "Next Speaker", show=True),
         Binding("ctrl+r", "randomize_next", "Random Next", show=True),
-        Binding("ctrl+c", "quit", "Quit", show=True),
+        Binding("q", "quit_app", "Quit", show=True),
     ]
 
     def __init__(self):
@@ -124,6 +146,7 @@ class TeaParty(App):
         self._speaking: str | None = None
         self._next_override: str | None = None
         self._turn = 0
+        self._tps: float | None = SPEED_DEFAULT  # None = no limit, 0 = frozen
         self._interrupted = threading.Event()
         self._pause_gate = threading.Event()
         self._pause_gate.set()  # start unpaused (gate open)
@@ -188,6 +211,27 @@ class TeaParty(App):
             if idx < len(MODELS):
                 self._next_override = MODELS[idx]
                 self._refresh_status()
+        elif event.character == "]":
+            if self._tps is None:
+                pass  # already unlimited
+            elif self._tps == 0:
+                self._tps = SPEED_MIN
+            else:
+                new = self._tps * SPEED_FACTOR
+                self._tps = None if new > SPEED_MAX else new
+            self._refresh_status()
+        elif event.character == "[":
+            if self._tps is None:
+                self._tps = SPEED_MAX
+            elif self._tps == 0:
+                pass  # already frozen
+            else:
+                new = self._tps / SPEED_FACTOR
+                self._tps = 0 if new < SPEED_MIN else new
+            self._refresh_status()
+        elif event.character == "\\":
+            self._tps = None
+            self._refresh_status()
 
     def action_toggle_pause(self) -> None:
         if not self._conversation_started:
@@ -215,8 +259,26 @@ class TeaParty(App):
         self._next_override = None
         self._refresh_status()
 
+    def action_quit_app(self) -> None:
+        # Don't quit if human input is focused — q is a letter
+        try:
+            self.query_one("#human-input")
+            return
+        except Exception:
+            pass
+        try:
+            self.query_one("#seed-input")
+            return
+        except Exception:
+            pass
+        # Unblock any waiting threads so they can see cancellation
+        self._interrupted.set()
+        self._pause_gate.set()
+        self._human_ready.set()
+        self.exit()
+
     def _refresh_status(self) -> None:
-        # Line 1: state
+        # Line 1: state + speed
         state_parts: list[str] = []
 
         if self._is_paused:
@@ -233,6 +295,15 @@ class TeaParty(App):
             state_parts.append("🔄 auto")
 
         state_parts.append(f"turn {self._turn}")
+
+        # Speed display
+        if self._tps is None:
+            state_parts.append("⚡ unlimited [dim]\\[slow \\]fast \\\\unlim[/dim]")
+        elif self._tps == 0:
+            state_parts.append("⚡ frozen [dim]\\[slow \\]fast \\\\unlim[/dim]")
+        else:
+            tps_rounded = int(round(self._tps))
+            state_parts.append(f"⚡ {tps_rounded} tok/s [dim]\\[slow \\]fast \\\\unlim[/dim]")
 
         line1 = " │ ".join(state_parts)
 
@@ -361,7 +432,6 @@ class TeaParty(App):
                 continue
 
             # AI model's turn
-            # Build messages from this model's perspective
             others = ", ".join(short_name(m) for m in MODELS if m != model)
             system_msg = system_tmpl.format(name=name, others=others)
 
@@ -382,15 +452,15 @@ class TeaParty(App):
             thinking_widget = Static(_thinking_text(name, color), classes="message", id=widget_id)
             self.call_from_thread(self._mount_message, thinking_widget)
 
-            # Stream response
-            response_text, was_interrupted = self._stream(model, merged, widget_id)
+            # Stream response with buffered playback
+            rendered_text, was_interrupted = self._stream(model, merged, widget_id)
 
-            if response_text:
+            if rendered_text:
                 suffix = "—" if was_interrupted else ""
-                history.append((model, f"[{name}]: {response_text}{suffix}"))
+                history.append((model, f"[{name}]: {rendered_text}{suffix}"))
                 self.call_from_thread(
                     self._update_message, widget_id,
-                    _build_message_text(name, color, response_text, suffix),
+                    _build_message_text(name, color, rendered_text, suffix),
                 )
             else:
                 # empty or error — widget already updated in _stream
@@ -403,55 +473,108 @@ class TeaParty(App):
     def _stream(self, model: str, messages: list[dict], widget_id: str) -> tuple[str, bool]:
         name = short_name(model)
         color = color_for(model)
-        full_text = ""
+
+        token_buf: queue.Queue[str] = queue.Queue()
+        stream_done = threading.Event()
+        stream_error: list[Exception | None] = [None]
+
+        # ── Producer: fills buffer from API at full speed ─────────────
+        def producer():
+            try:
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    timeout=120.0,
+                )
+                for chunk in stream:
+                    if self._interrupted.is_set():
+                        stream.close()
+                        break
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        token_buf.put(chunk.choices[0].delta.content)
+            except Exception as e:
+                stream_error[0] = e
+            finally:
+                stream_done.set()
+
+        producer_thread = threading.Thread(target=producer, daemon=True)
+        producer_thread.start()
+
+        # ── Consumer: renders from buffer at controlled speed ─────────
+        rendered_text = ""
         was_interrupted = False
+        last_render = 0.0
+        MIN_RENDER_INTERVAL = 1.0 / 30  # cap UI updates at ~30fps
 
-        try:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                timeout=120.0,
-            )
+        while True:
+            if self._interrupted.is_set():
+                was_interrupted = True
+                break
 
-            for chunk in stream:
-                if self._interrupted.is_set():
-                    was_interrupted = True
-                    stream.close()
+            try:
+                token = token_buf.get(timeout=0.05)
+            except queue.Empty:
+                if stream_done.is_set() and token_buf.empty():
                     break
+                continue
 
-                if chunk.choices and chunk.choices[0].delta.content:
-                    token = chunk.choices[0].delta.content
-                    full_text += token
-                    self.call_from_thread(
-                        self._update_message, widget_id,
-                        _build_message_text(name, color, full_text),
-                    )
+            rendered_text += token
 
-        except Exception as e:
+            # Throttle UI updates to avoid overwhelming Textual
+            now = time.monotonic()
+            if now - last_render >= MIN_RENDER_INTERVAL:
+                self.call_from_thread(
+                    self._update_message, widget_id,
+                    _build_message_text(name, color, rendered_text),
+                )
+                last_render = now
+
+            # Speed-controlled delay between tokens
+            if self._tps is None:
+                pass  # no limit
+            elif self._tps == 0:
+                # Frozen — wait until speed changes or interrupted
+                while self._tps == 0 and not self._interrupted.is_set():
+                    time.sleep(0.05)
+            else:
+                time.sleep(1.0 / self._tps)
+
+        # Wait for producer to finish (it will stop on interrupt or naturally)
+        producer_thread.join(timeout=2.0)
+
+        # Handle errors
+        if stream_error[0] and not rendered_text:
             err_text = Text()
             err_text.append(f"[{name}] ", style=f"bold {color}")
-            err_text.append(f"Error: {e}", style="red")
+            err_text.append(f"Error: {stream_error[0]}", style="red")
             self.call_from_thread(self._update_message, widget_id, err_text)
             return "", False
 
-        if was_interrupted:
-            self.call_from_thread(
-                self._update_message, widget_id,
-                _build_message_text(name, color, full_text, "…"),
-            )
-        elif not full_text:
+        # Final render to make sure everything rendered is visible
+        if rendered_text:
+            if was_interrupted:
+                self.call_from_thread(
+                    self._update_message, widget_id,
+                    _build_message_text(name, color, rendered_text, "…"),
+                )
+            else:
+                self.call_from_thread(
+                    self._update_message, widget_id,
+                    _build_message_text(name, color, rendered_text),
+                )
+        elif not rendered_text and not stream_error[0]:
             empty = Text()
             empty.append(f"[{name}] ", style=f"bold {color}")
             empty.append("(empty response)", style="dim")
             self.call_from_thread(self._update_message, widget_id, empty)
 
-        return full_text, was_interrupted
+        return rendered_text, was_interrupted
 
 
 if __name__ == "__main__":
     if not OPENROUTER_API_KEY:
-        print("Set OPENROUTER_API_KEY environment variable.")
+        print("Set apiToken in config.json or OPENROUTER_API_KEY env var.")
         sys.exit(1)
     app = TeaParty()
     app.run()
