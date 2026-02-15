@@ -83,21 +83,19 @@ def color_for(model_id: str) -> str:
     return MODEL_COLORS[idx % len(MODEL_COLORS)]
 
 
-def _build_message_text(name: str, color: str, body: str, suffix: str = "") -> Text:
-    t = Text()
-    t.append(f"[{name}] ", style=f"bold {color}")
-    t.append(body + suffix)
-    return t
+def _speaker(model_id: str) -> tuple[str, str]:
+    return short_name(model_id), color_for(model_id)
 
 
-def _thinking_text(name: str, color: str) -> Text:
+def _prefixed_text(name: str, color: str, body: str, body_style: str = "", suffix: str = "") -> Text:
     t = Text()
     t.append(f"[{name}] ", style=f"bold {color}")
-    t.append("thinking…", style="dim italic")
+    t.append(body + suffix, style=body_style)
     return t
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
+
 class StatusBar(Static):
     DEFAULT_CSS = """
     StatusBar {
@@ -195,36 +193,28 @@ class TeaParty(App):
         if not self._conversation_started:
             return
         # Don't intercept keys when human input is active
-        try:
-            self.query_one("#human-input")
+        if self.query("#human-input"):
             return
-        except Exception:
-            pass
         if event.character and event.character in "123456789":
             idx = int(event.character) - 1
             if idx < len(MODELS):
                 self._next_override = MODELS[idx]
                 self._refresh_status()
-        elif event.character == "]":
-            if self._tps is None:
-                pass  # already unlimited
-            elif self._tps == 0:
-                self._tps = SPEED_MIN
-            else:
-                new = self._tps * SPEED_FACTOR
-                self._tps = None if new > SPEED_MAX else new
-            self._refresh_status()
-        elif event.character == "[":
-            if self._tps is None:
-                self._tps = SPEED_MAX
-            elif self._tps == 0:
-                pass  # already frozen
-            else:
-                new = self._tps / SPEED_FACTOR
-                self._tps = 0 if new < SPEED_MIN else new
-            self._refresh_status()
-        elif event.character == "\\":
-            self._tps = None
+        elif event.character and event.character in "[]\\":
+            if event.character == "]" and self._tps is not None:
+                if self._tps == 0:
+                    self._tps = SPEED_MIN
+                else:
+                    new = self._tps * SPEED_FACTOR
+                    self._tps = None if new > SPEED_MAX else new
+            elif event.character == "[" and self._tps != 0:
+                if self._tps is None:
+                    self._tps = SPEED_MAX
+                else:
+                    new = self._tps / SPEED_FACTOR
+                    self._tps = 0 if new < SPEED_MIN else new
+            elif event.character == "\\":
+                self._tps = None
             self._refresh_status()
 
     def action_toggle_pause(self) -> None:
@@ -254,17 +244,9 @@ class TeaParty(App):
         self._refresh_status()
 
     def action_quit_app(self) -> None:
-        # Don't quit if human input is focused — q is a letter
-        try:
-            self.query_one("#human-input")
+        # Don't quit if human input or seed input is focused — q is a letter
+        if self.query("#human-input") or self.query("#seed-input"):
             return
-        except Exception:
-            pass
-        try:
-            self.query_one("#seed-input")
-            return
-        except Exception:
-            pass
         # Unblock any waiting threads so they can see cancellation
         self._interrupted.set()
         self._pause_gate.set()
@@ -291,25 +273,26 @@ class TeaParty(App):
         state_parts.append(f"turn {self._turn}")
 
         # Speed display
+        hint = "[dim]\\[slow \\]fast \\\\unlim[/dim]"
         if self._tps is None:
-            state_parts.append("⚡ unlimited [dim]\\[slow \\]fast \\\\unlim[/dim]")
+            speed = "unlimited"
         elif self._tps == 0:
-            state_parts.append("⚡ frozen [dim]\\[slow \\]fast \\\\unlim[/dim]")
+            speed = "frozen"
         else:
-            tps_rounded = int(round(self._tps))
-            state_parts.append(f"⚡ {tps_rounded} tok/s [dim]\\[slow \\]fast \\\\unlim[/dim]")
+            speed = f"{int(round(self._tps))} tok/s"
+        state_parts.append(f"⚡ {speed} {hint}")
 
         line1 = " │ ".join(state_parts)
 
         # Line 2: model keys
         model_keys = "  ".join(
-            f"[{color_for(m)}]{i+1}={short_name(m)}[/{color_for(m)}]"
+            f"[{c}]{i+1}={short_name(m)}[/{c}]"
             for i, m in enumerate(MODELS)
+            for c in (color_for(m),)
         )
-        line2 = model_keys
 
         try:
-            self.query_one("#status", StatusBar).update(f"{line1}\n{line2}")
+            self.query_one("#status", StatusBar).update(f"{line1}\n{model_keys}")
         except Exception:
             pass
 
@@ -332,10 +315,8 @@ class TeaParty(App):
         inp.focus()
 
     def _hide_human_input(self) -> None:
-        try:
-            self.query_one("#human-input").remove()
-        except Exception:
-            pass
+        for w in self.query("#human-input"):
+            w.remove()
 
     @work(thread=True)
     def _run_conversation(self, seed: str) -> None:
@@ -381,8 +362,7 @@ class TeaParty(App):
                 candidates = [m for m in MODELS if m != last_model]
                 model = random.choice(candidates)
 
-            name = short_name(model)
-            color = color_for(model)
+            name, color = _speaker(model)
             self._speaking = name
             self.call_from_thread(self._refresh_status)
 
@@ -390,10 +370,10 @@ class TeaParty(App):
 
             if model == HUMAN:
                 # Human's turn — show input and wait
-                waiting_text = Text()
-                waiting_text.append(f"[{name}] ", style=f"bold {color}")
-                waiting_text.append("waiting for input…", style="dim italic")
-                waiting_widget = Static(waiting_text, classes="message", id=widget_id)
+                waiting_widget = Static(
+                    _prefixed_text(name, color, "waiting for input…", body_style="dim italic"),
+                    classes="message", id=widget_id,
+                )
                 self.call_from_thread(self._mount_message, waiting_widget)
                 self.call_from_thread(self._show_human_input)
 
@@ -406,7 +386,7 @@ class TeaParty(App):
                         self.call_from_thread(self._hide_human_input)
                         self.call_from_thread(
                             self._update_message, widget_id,
-                            _build_message_text(name, color, "(skipped)", ""),
+                            _prefixed_text(name, color, "(skipped)"),
                         )
                         self._speaking = None
                         self.call_from_thread(self._refresh_status)
@@ -417,7 +397,7 @@ class TeaParty(App):
                     response_text = self._human_text
                     self.call_from_thread(
                         self._update_message, widget_id,
-                        _build_message_text(name, color, response_text),
+                        _prefixed_text(name, color, response_text),
                     )
                     history.append((model, f"[{name}]: {response_text}"))
                     last_model = model
@@ -443,7 +423,10 @@ class TeaParty(App):
                     merged.append(dict(msg))
 
             # Mount thinking widget
-            thinking_widget = Static(_thinking_text(name, color), classes="message", id=widget_id)
+            thinking_widget = Static(
+                _prefixed_text(name, color, "thinking…", body_style="dim italic"),
+                classes="message", id=widget_id,
+            )
             self.call_from_thread(self._mount_message, thinking_widget)
 
             # Stream response with buffered playback
@@ -454,19 +437,15 @@ class TeaParty(App):
                 history.append((model, f"[{name}]: {rendered_text}{suffix}"))
                 self.call_from_thread(
                     self._update_message, widget_id,
-                    _build_message_text(name, color, rendered_text, suffix),
+                    _prefixed_text(name, color, rendered_text, suffix=suffix),
                 )
-            else:
-                # empty or error — widget already updated in _stream
-                pass
 
             last_model = model
             self._speaking = None
             self.call_from_thread(self._refresh_status)
 
     def _stream(self, model: str, messages: list[dict], widget_id: str) -> tuple[str, bool]:
-        name = short_name(model)
-        color = color_for(model)
+        name, color = _speaker(model)
 
         token_buf: queue.Queue[str] = queue.Queue()
         stream_done = threading.Event()
@@ -520,7 +499,7 @@ class TeaParty(App):
             if now - last_render >= MIN_RENDER_INTERVAL:
                 self.call_from_thread(
                     self._update_message, widget_id,
-                    _build_message_text(name, color, rendered_text),
+                    _prefixed_text(name, color, rendered_text),
                 )
                 last_render = now
 
@@ -539,29 +518,24 @@ class TeaParty(App):
 
         # Handle errors
         if stream_error[0] and not rendered_text:
-            err_text = Text()
-            err_text.append(f"[{name}] ", style=f"bold {color}")
-            err_text.append(f"Error: {stream_error[0]}", style="red")
-            self.call_from_thread(self._update_message, widget_id, err_text)
+            self.call_from_thread(
+                self._update_message, widget_id,
+                _prefixed_text(name, color, f"Error: {stream_error[0]}", body_style="red"),
+            )
             return "", False
 
         # Final render to make sure everything rendered is visible
         if rendered_text:
-            if was_interrupted:
-                self.call_from_thread(
-                    self._update_message, widget_id,
-                    _build_message_text(name, color, rendered_text, "…"),
-                )
-            else:
-                self.call_from_thread(
-                    self._update_message, widget_id,
-                    _build_message_text(name, color, rendered_text),
-                )
-        elif not rendered_text and not stream_error[0]:
-            empty = Text()
-            empty.append(f"[{name}] ", style=f"bold {color}")
-            empty.append("(empty response)", style="dim")
-            self.call_from_thread(self._update_message, widget_id, empty)
+            suffix = "…" if was_interrupted else ""
+            self.call_from_thread(
+                self._update_message, widget_id,
+                _prefixed_text(name, color, rendered_text, suffix=suffix),
+            )
+        elif not stream_error[0]:
+            self.call_from_thread(
+                self._update_message, widget_id,
+                _prefixed_text(name, color, "(empty response)", body_style="dim"),
+            )
 
         return rendered_text, was_interrupted
 
