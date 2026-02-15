@@ -160,12 +160,6 @@ class TeaParty(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        if not OPENROUTER_API_KEY:
-            chat = self.query_one("#chat")
-            chat.mount(Static("[bold red]Set OPENROUTER_API_KEY environment variable.[/]"))
-            self.query_one("#seed-input").remove()
-            return
-
         # Show model list in chat
         chat = self.query_one("#chat")
         lines = Text()
