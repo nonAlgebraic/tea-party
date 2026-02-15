@@ -200,22 +200,28 @@ class TeaParty(App):
             if idx < len(MODELS):
                 self._next_override = MODELS[idx]
                 self._refresh_status()
-        elif event.character and event.character in "[]\\":
-            if event.character == "]" and self._tps is not None:
-                if self._tps == 0:
-                    self._tps = SPEED_MIN
-                else:
-                    new = self._tps * SPEED_FACTOR
-                    self._tps = None if new > SPEED_MAX else new
-            elif event.character == "[" and self._tps != 0:
-                if self._tps is None:
-                    self._tps = SPEED_MAX
-                else:
-                    new = self._tps / SPEED_FACTOR
-                    self._tps = 0 if new < SPEED_MIN else new
-            elif event.character == "\\":
-                self._tps = None
-            self._refresh_status()
+        elif event.character:
+            speed_keys = {"]": 1, "[": -1, "\\": 0}
+            if event.character in speed_keys:
+                self._adjust_speed(speed_keys[event.character])
+
+    def _adjust_speed(self, direction: int) -> None:
+        """direction: +1 = faster, -1 = slower, 0 = unlimited"""
+        if direction == 0:
+            self._tps = None
+        elif direction == 1 and self._tps is not None:
+            if self._tps == 0:
+                self._tps = SPEED_MIN
+            else:
+                new = self._tps * SPEED_FACTOR
+                self._tps = None if new > SPEED_MAX else new
+        elif direction == -1 and self._tps != 0:
+            if self._tps is None:
+                self._tps = SPEED_MAX
+            else:
+                new = self._tps / SPEED_FACTOR
+                self._tps = 0 if new < SPEED_MIN else new
+        self._refresh_status()
 
     def action_toggle_pause(self) -> None:
         if not self._conversation_started:
@@ -309,6 +315,9 @@ class TeaParty(App):
         except Exception:
             pass
 
+    def _update_prefixed(self, widget_id: str, name: str, color: str, body: str, **kw) -> None:
+        self.call_from_thread(self._update_message, widget_id, _prefixed_text(name, color, body, **kw))
+
     def _show_human_input(self) -> None:
         inp = Input(placeholder="Your turn — type your message…", id="human-input")
         self.mount(inp, after=self.query_one("#status"))
@@ -317,6 +326,15 @@ class TeaParty(App):
     def _hide_human_input(self) -> None:
         for w in self.query("#human-input"):
             w.remove()
+
+    def _wait_or_cancel(self, event: threading.Event, worker, also_break_on: threading.Event | None = None) -> str:
+        """Block until event is set. Returns 'ready', 'cancelled', or 'interrupted'."""
+        while not event.wait(timeout=0.3):
+            if worker.is_cancelled:
+                return "cancelled"
+            if also_break_on and also_break_on.is_set():
+                return "interrupted"
+        return "ready"
 
     @work(thread=True)
     def _run_conversation(self, seed: str) -> None:
@@ -345,9 +363,8 @@ class TeaParty(App):
 
         while not worker.is_cancelled:
             # Pause gate — blocks while paused
-            while not self._pause_gate.wait(timeout=0.3):
-                if worker.is_cancelled:
-                    return
+            if self._wait_or_cancel(self._pause_gate, worker) == "cancelled":
+                return
 
             self._interrupted.clear()
             self._turn += 1
@@ -362,87 +379,78 @@ class TeaParty(App):
                 candidates = [m for m in MODELS if m != last_model]
                 model = random.choice(candidates)
 
-            name, color = _speaker(model)
-            self._speaking = name
+            self._speaking = short_name(model)
             self.call_from_thread(self._refresh_status)
 
             widget_id = f"msg-{self._turn}"
 
             if model == HUMAN:
-                # Human's turn — show input and wait
-                waiting_widget = Static(
-                    _prefixed_text(name, color, "waiting for input…", body_style="dim italic"),
-                    classes="message", id=widget_id,
-                )
-                self.call_from_thread(self._mount_message, waiting_widget)
-                self.call_from_thread(self._show_human_input)
+                last_model = self._handle_human_turn(worker, model, widget_id, history)
+            else:
+                last_model = self._handle_ai_turn(model, widget_id, history, system_tmpl)
 
-                self._human_ready.clear()
-                while not self._human_ready.wait(timeout=0.3):
-                    if worker.is_cancelled:
-                        return
-                    if self._interrupted.is_set():
-                        # User interrupted their own turn — skip it
-                        self.call_from_thread(self._hide_human_input)
-                        self.call_from_thread(
-                            self._update_message, widget_id,
-                            _prefixed_text(name, color, "(skipped)"),
-                        )
-                        self._speaking = None
-                        self.call_from_thread(self._refresh_status)
-                        last_model = model
-                        break
-                else:
-                    # Got human input
-                    response_text = self._human_text
-                    self.call_from_thread(
-                        self._update_message, widget_id,
-                        _prefixed_text(name, color, response_text),
-                    )
-                    history.append((model, f"[{name}]: {response_text}"))
-                    last_model = model
-                    self._speaking = None
-                    self.call_from_thread(self._refresh_status)
-                continue
-
-            # AI model's turn
-            others = ", ".join(short_name(m) for m in MODELS if m != model)
-            system_msg = system_tmpl.format(name=name, others=others)
-
-            full_messages: list[dict] = [{"role": "system", "content": system_msg}]
-            for speaker, content in history:
-                role = "assistant" if speaker == model else "user"
-                full_messages.append({"role": role, "content": content})
-
-            # Merge consecutive same-role messages
-            merged: list[dict] = []
-            for msg in full_messages:
-                if merged and merged[-1]["role"] == msg["role"]:
-                    merged[-1]["content"] += "\n\n" + msg["content"]
-                else:
-                    merged.append(dict(msg))
-
-            # Mount thinking widget
-            thinking_widget = Static(
-                _prefixed_text(name, color, "thinking…", body_style="dim italic"),
-                classes="message", id=widget_id,
-            )
-            self.call_from_thread(self._mount_message, thinking_widget)
-
-            # Stream response with buffered playback
-            rendered_text, was_interrupted = self._stream(model, merged, widget_id)
-
-            if rendered_text:
-                suffix = "—" if was_interrupted else ""
-                history.append((model, f"[{name}]: {rendered_text}{suffix}"))
-                self.call_from_thread(
-                    self._update_message, widget_id,
-                    _prefixed_text(name, color, rendered_text, suffix=suffix),
-                )
-
-            last_model = model
             self._speaking = None
             self.call_from_thread(self._refresh_status)
+
+    def _handle_human_turn(self, worker, model, widget_id, history) -> str:
+        name, color = _speaker(model)
+        waiting_widget = Static(
+            _prefixed_text(name, color, "waiting for input…", body_style="dim italic"),
+            classes="message", id=widget_id,
+        )
+        self.call_from_thread(self._mount_message, waiting_widget)
+        self.call_from_thread(self._show_human_input)
+
+        self._human_ready.clear()
+        result = self._wait_or_cancel(self._human_ready, worker, also_break_on=self._interrupted)
+
+        if result == "cancelled":
+            return model
+        elif result == "interrupted":
+            self.call_from_thread(self._hide_human_input)
+            self._update_prefixed(widget_id, name, color, "(skipped)")
+            return model
+
+        # Got human input
+        response_text = self._human_text
+        self._update_prefixed(widget_id, name, color, response_text)
+        history.append((model, f"[{name}]: {response_text}"))
+        return model
+
+    def _handle_ai_turn(self, model, widget_id, history, system_tmpl) -> str:
+        name, color = _speaker(model)
+        others = ", ".join(short_name(m) for m in MODELS if m != model)
+        system_msg = system_tmpl.format(name=name, others=others)
+
+        full_messages: list[dict] = [{"role": "system", "content": system_msg}]
+        for speaker, content in history:
+            role = "assistant" if speaker == model else "user"
+            full_messages.append({"role": role, "content": content})
+
+        # Merge consecutive same-role messages
+        merged: list[dict] = []
+        for msg in full_messages:
+            if merged and merged[-1]["role"] == msg["role"]:
+                merged[-1]["content"] += "\n\n" + msg["content"]
+            else:
+                merged.append(dict(msg))
+
+        # Mount thinking widget
+        thinking_widget = Static(
+            _prefixed_text(name, color, "thinking…", body_style="dim italic"),
+            classes="message", id=widget_id,
+        )
+        self.call_from_thread(self._mount_message, thinking_widget)
+
+        # Stream response with buffered playback
+        rendered_text, was_interrupted = self._stream(model, merged, widget_id)
+
+        if rendered_text:
+            suffix = "—" if was_interrupted else ""
+            history.append((model, f"[{name}]: {rendered_text}{suffix}"))
+            self._update_prefixed(widget_id, name, color, rendered_text, suffix=suffix)
+
+        return model
 
     def _stream(self, model: str, messages: list[dict], widget_id: str) -> tuple[str, bool]:
         name, color = _speaker(model)
@@ -497,10 +505,7 @@ class TeaParty(App):
             # Throttle UI updates to avoid overwhelming Textual
             now = time.monotonic()
             if now - last_render >= MIN_RENDER_INTERVAL:
-                self.call_from_thread(
-                    self._update_message, widget_id,
-                    _prefixed_text(name, color, rendered_text),
-                )
+                self._update_prefixed(widget_id, name, color, rendered_text)
                 last_render = now
 
             # Speed-controlled delay between tokens
@@ -518,24 +523,14 @@ class TeaParty(App):
 
         # Handle errors
         if stream_error[0] and not rendered_text:
-            self.call_from_thread(
-                self._update_message, widget_id,
-                _prefixed_text(name, color, f"Error: {stream_error[0]}", body_style="red"),
-            )
+            self._update_prefixed(widget_id, name, color, f"Error: {stream_error[0]}", body_style="red")
             return "", False
 
         # Final render to make sure everything rendered is visible
         if rendered_text:
-            suffix = "…" if was_interrupted else ""
-            self.call_from_thread(
-                self._update_message, widget_id,
-                _prefixed_text(name, color, rendered_text, suffix=suffix),
-            )
+            self._update_prefixed(widget_id, name, color, rendered_text, suffix="…" if was_interrupted else "")
         elif not stream_error[0]:
-            self.call_from_thread(
-                self._update_message, widget_id,
-                _prefixed_text(name, color, "(empty response)", body_style="dim"),
-            )
+            self._update_prefixed(widget_id, name, color, "(empty response)", body_style="dim")
 
         return rendered_text, was_interrupted
 
