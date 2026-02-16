@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Multi-model AI group conversation TUI powered by Textual and OpenRouter."""
+"""Multi-model AI group conversation TUI powered by Textual and OpenAI-compatible APIs."""
 
 __all__ = ["TeaParty", "main"]
 
 import logging
-import os
 import queue
 import random
 import sys
@@ -67,7 +66,7 @@ class Turn(NamedTuple):
 
 class AppConfig(NamedTuple):
     models: list[str]
-    api_key: str
+    clients: dict[str, OpenAI]  # model_id -> OpenAI client
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -195,10 +194,7 @@ class TeaParty(App):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._models: list[str] = config.models
-        self._client: OpenAI = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=config.api_key,
-        )
+        self._clients: dict[str, OpenAI] = config.clients
         self._conversation_started: bool = False
         self._is_paused: bool = False
         self._speaking: str | None = None
@@ -596,7 +592,7 @@ class TeaParty(App):
 
         def producer() -> None:
             try:
-                stream = self._client.chat.completions.create(
+                stream = self._clients[model].chat.completions.create(
                     model=model,
                     messages=messages,
                     stream=True,
@@ -680,18 +676,48 @@ class TeaParty(App):
 def main() -> None:
     """Load configuration, validate, and run the application."""
     raw = _load_config()
-    if "models" not in raw:
-        print("config.json must contain a 'models' array.")
+
+    if "providers" not in raw or not isinstance(raw["providers"], list):
+        print("config.json must contain a 'providers' array.")
         sys.exit(1)
 
-    models = [m for m in raw["models"] if m != HUMAN] + [HUMAN]
-    api_key: str = raw.get("apiToken") or os.environ.get("OPENROUTER_API_KEY") or ""
+    all_models: list[str] = []
+    clients: dict[str, OpenAI] = {}
 
-    if not api_key:
-        print("Set apiToken in config.json or OPENROUTER_API_KEY env var.")
+    for i, provider in enumerate(raw["providers"]):
+        url = provider.get("url")
+        token = provider.get("token", "")
+        provider_models = provider.get("models", [])
+
+        if not url:
+            print(f"Provider at index {i} is missing 'url'.")
+            sys.exit(1)
+        if not token:
+            print(f"Provider at index {i} (url={url}) is missing 'token'.")
+            sys.exit(1)
+        if not provider_models:
+            print(f"Provider at index {i} (url={url}) has no models.")
+            sys.exit(1)
+
+        client = OpenAI(base_url=url, api_key=token)
+
+        for model_id in provider_models:
+            if model_id == HUMAN:
+                print(f"Model name '{HUMAN}' is reserved; do not list it in providers.")
+                sys.exit(1)
+            if model_id in clients:
+                print(f"Duplicate model '{model_id}' found across providers.")
+                sys.exit(1)
+            clients[model_id] = client
+            all_models.append(model_id)
+
+    if len(all_models) < 1:
+        print("At least one AI model must be configured across providers.")
         sys.exit(1)
 
-    app = TeaParty(AppConfig(models=models, api_key=api_key))
+    all_models.append(HUMAN)
+
+    app = TeaParty(AppConfig(models=all_models, clients=clients))
     try:
         app.run()
     except KeyboardInterrupt:
