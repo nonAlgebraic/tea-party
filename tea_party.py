@@ -12,10 +12,11 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 import json5
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -562,7 +563,9 @@ class TeaParty(App):
         )
         self.call_from_thread(self._mount_message, thinking_widget)
 
-        rendered_text, was_interrupted = self._stream(model, merged, widget_id)
+        rendered_text, was_interrupted = self._stream(
+            model, cast(list[ChatCompletionMessageParam], merged), widget_id
+        )
 
         if rendered_text:
             suffix = "—" if was_interrupted else ""
@@ -576,7 +579,7 @@ class TeaParty(App):
     def _stream(
         self,
         model: str,
-        messages: list[dict[str, str]],
+        messages: list[ChatCompletionMessageParam],
         widget_id: str,
     ) -> tuple[str, bool]:
         """Stream a model response with speed-controlled playback.
