@@ -21,7 +21,6 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.css.query import NoMatches
 from textual.events import Key
 from textual.message import Message
 from textual.widgets import Footer, Static, TextArea
@@ -211,8 +210,7 @@ class TeaParty(App):
     # ── Model helpers ─────────────────────────────────────────────
 
     def _color_for(self, model_id: str) -> str:
-        idx = self._models.index(model_id) if model_id in self._models else 0
-        return MODEL_COLORS[idx % len(MODEL_COLORS)]
+        return MODEL_COLORS[self._models.index(model_id) % len(MODEL_COLORS)]
 
     def _speaker_for(self, model_id: str) -> tuple[str, str]:
         return short_name(model_id), self._color_for(model_id)
@@ -382,10 +380,7 @@ class TeaParty(App):
             parts.append(f"[{c}]^{i + 1}={short_name(m)}[/{c}]")
         model_keys = "  ".join(parts)
 
-        try:
-            self.query_one("#status", StatusBar).update(f"{line1}\n{model_keys}")
-        except NoMatches:
-            logger.debug("Status bar widget not found")
+        self.query_one("#status", StatusBar).update(f"{line1}\n{model_keys}")
 
     # ── Widget helpers ────────────────────────────────────────────
 
@@ -395,12 +390,8 @@ class TeaParty(App):
         chat.scroll_end(animate=False)
 
     def _update_message(self, widget_id: str, content: Text) -> None:
-        try:
-            w = self.query_one(f"#{widget_id}", Static)
-            w.update(content)
-            self.query_one("#chat").scroll_end(animate=False)
-        except NoMatches:
-            logger.debug("Widget #%s not found for update", widget_id)
+        self.query_one(f"#{widget_id}", Static).update(content)
+        self.query_one("#chat").scroll_end(animate=False)
 
     def _update_prefixed(
         self, widget_id: str, name: str, color: str, body: str, **kw: str
@@ -646,7 +637,7 @@ class TeaParty(App):
             else:
                 time.sleep(1.0 / self._tps)
 
-        producer_thread.join(timeout=2.0)
+        producer_thread.join()
 
         if state.error and not rendered_text:
             self._update_prefixed(
