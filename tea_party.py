@@ -25,7 +25,7 @@ from textual.containers import VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key
 from textual.message import Message
-from textual.widgets import Footer, Input, Static, TextArea
+from textual.widgets import Footer, Static, TextArea
 from textual.worker import Worker, get_current_worker
 
 logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ class StatusBar(Static):
     StatusBar {
         dock: bottom;
         height: 2;
-        background: $surface;
+        background: $panel;
         color: $text-muted;
         padding: 0 1;
     }
@@ -178,9 +178,6 @@ class TeaParty(App):
         padding: 0 0 0 1;
         color: $text-muted;
     }
-    #seed-input {
-        dock: bottom;
-    }
     ChatInput {
         dock: bottom;
         height: 3;
@@ -228,8 +225,12 @@ class TeaParty(App):
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat")
+        yield ChatInput(
+            placeholder="Enter seed prompt…",
+            id="seed-input",
+            soft_wrap=True,
+        )
         yield StatusBar(id="status")
-        yield Input(placeholder="Enter seed prompt…", id="seed-input")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -240,7 +241,7 @@ class TeaParty(App):
             c = self._color_for(m)
             lines.append(f"  {i + 1}. {short_name(m)}\n", style=c)
         lines.append(
-            "\nPress Ctrl+number during conversation to pick who speaks next.\n",
+            "\nPress Ctrl+number to pick who speaks next.\n",
             style="dim",
         )
         chat.mount(Static(lines, classes="model-list"))
@@ -250,26 +251,23 @@ class TeaParty(App):
 
     # ── Event handlers ────────────────────────────────────────────
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "seed-input":
-            seed = event.value.strip()
-            if not seed:
-                return
-            self.query_one("#seed-input").remove()
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
+        if not self._conversation_started:
+            # Seed prompt
+            for w in self.query("#seed-input"):
+                w.remove()
             self._conversation_started = True
             self._refresh_status()
-            self._run_conversation(seed)
-
-    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
-        self._human_text = event.value
-        self._human_ready.set()
-        for w in self.query("#human-input"):
-            w.remove()
+            self._run_conversation(event.value)
+        else:
+            # Human turn
+            self._human_text = event.value
+            self._human_ready.set()
+            for w in self.query("#human-input"):
+                w.remove()
 
     def on_key(self, event: Key) -> None:
-        if not self._conversation_started:
-            return
-        # Ctrl+number for model selection — works even during text input
+        # Ctrl+number for model selection — works anytime, even during input
         for i in range(1, 10):
             if event.key == f"ctrl+{i}":
                 idx = i - 1
@@ -278,7 +276,9 @@ class TeaParty(App):
                     self._refresh_status()
                     event.prevent_default()
                 return
-        # Speed controls — only when not in text input
+        # Speed controls — only during active conversation, not during input
+        if not self._conversation_started:
+            return
         if self.query("#human-input") or self.query("#seed-input"):
             return
         if event.character:
@@ -350,7 +350,9 @@ class TeaParty(App):
     def _refresh_status(self) -> None:
         state_parts: list[str] = []
 
-        if self._is_paused:
+        if not self._conversation_started:
+            state_parts.append("✏️  enter seed prompt")
+        elif self._is_paused:
             state_parts.append("⏸  PAUSED")
         elif self._speaking:
             state_parts.append(f"💬 {self._speaking}")
