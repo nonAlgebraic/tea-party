@@ -1,53 +1,40 @@
 #!/usr/bin/env python3
+"""Multi-model AI group conversation TUI powered by Textual and OpenRouter."""
 
+__all__ = ["TeaParty", "main"]
+
+import logging
 import os
-import sys
-import random
-import threading
 import queue
+import random
+import sys
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import NamedTuple
+
 import json5
 from openai import OpenAI
 from rich.text import Text
-
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.widgets import Footer, Input, Static
-from textual.worker import get_current_worker
+from textual.css.query import NoMatches
+from textual.events import Key
+from textual.message import Message
+from textual.widgets import Footer, Input, Static, TextArea
+from textual.worker import Worker, get_current_worker
 
-# ── Config ────────────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
 HUMAN = "human"
-
 CONFIG_DIR = Path(__file__).parent
 
-
-def _load_config() -> dict:
-    for name in ("config.json5", "config.json"):
-        path = CONFIG_DIR / name
-        if path.exists():
-            with open(path) as f:
-                return json5.load(f)
-    return {}
-
-
-_config = _load_config()
-
-if "models" not in _config:
-    print("config.json must contain a 'models' array.")
-    sys.exit(1)
-
-MODELS: list[str] = [m for m in _config["models"] if m != HUMAN] + [HUMAN]
-
-OPENROUTER_API_KEY: str = (
-    _config.get("apiToken")
-    or os.environ.get("OPENROUTER_API_KEY")
-    or ""
-)
-
-MODEL_COLORS = [
+MODEL_COLORS: list[str] = [
     "bright_cyan",
     "bright_magenta",
     "bright_green",
@@ -60,43 +47,68 @@ MODEL_COLORS = [
     "cornflower_blue",
 ]
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+# Speed presets: tokens per second (None = unlimited, 0 = frozen)
+SPEED_MIN: float = 3
+SPEED_MAX: float = 500
+SPEED_FACTOR: float = 1.5
+MIN_RENDER_INTERVAL: float = 1.0 / 30  # cap UI updates at ~30 fps
 
-# Speed presets: tokens per second (None = no limit, 0 = frozen)
-SPEED_MIN = 3
-SPEED_MAX = 500
-SPEED_DEFAULT = None
-SPEED_FACTOR = 1.5
+
+# ── Data types ────────────────────────────────────────────────────────────────
+
+
+class Turn(NamedTuple):
+    """A single turn in the conversation history."""
+
+    speaker: str | None
+    content: str
+
+
+class AppConfig(NamedTuple):
+    models: list[str]
+    api_key: str
+
+
+# ── Pure helpers ──────────────────────────────────────────────────────────────
+
+
+def _load_config() -> dict:
+    """Load JSON5/JSON config from the application directory."""
+    for name in ("config.json5", "config.json"):
+        path = CONFIG_DIR / name
+        if path.exists():
+            with open(path) as f:
+                return json5.load(f)
+    return {}
 
 
 def short_name(model_id: str) -> str:
+    """Return a display-friendly short name for a model."""
     if model_id == HUMAN:
         return "you"
     return model_id.split("/")[-1]
 
 
-def color_for(model_id: str) -> str:
-    idx = MODELS.index(model_id) if model_id in MODELS else 0
-    return MODEL_COLORS[idx % len(MODEL_COLORS)]
-
-
-def _speaker(model_id: str) -> tuple[str, str]:
-    return short_name(model_id), color_for(model_id)
-
-
-def _prefixed_text(name: str, color: str, body: str, body_style: str = "", suffix: str = "") -> Text:
+def _prefixed_text(
+    name: str,
+    color: str,
+    body: str,
+    body_style: str = "",
+    suffix: str = "",
+) -> Text:
+    """Build a Rich Text with a colored ``[name]`` prefix."""
     t = Text()
     t.append(f"[{name}] ", style=f"bold {color}")
     t.append(body + suffix, style=body_style)
     return t
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── Widgets ───────────────────────────────────────────────────────────────────
+
 
 class StatusBar(Static):
+    """Bottom status bar showing conversation state and controls."""
+
     DEFAULT_CSS = """
     StatusBar {
         dock: bottom;
@@ -108,7 +120,52 @@ class StatusBar(Static):
     """
 
 
+class ChatInput(TextArea):
+    """A multi-line text area that submits on Enter and grows vertically."""
+
+    class Submitted(Message):
+        """Posted when the user presses Enter."""
+
+        bubble = True
+
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    MAX_HEIGHT = 14
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            text = self.text.strip()
+            if text:
+                self.post_message(self.Submitted(text))
+            return
+        await super()._on_key(event)
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self._update_height()
+
+    def on_resize(self) -> None:
+        self._update_height()
+
+    def _update_height(self) -> None:
+        # Use TextArea's own wrapped line count — it already knows
+        # exactly how lines break with soft wrapping.
+        visual_lines = self.wrapped_document.height
+        # +2 for top and bottom border, +1 for cursor at wrap boundary
+        needed = visual_lines + 3
+        needed = max(3, min(needed, self.MAX_HEIGHT))
+        self.styles.height = needed
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+
 class TeaParty(App):
+    """Multi-model AI group conversation TUI."""
+
     CSS = """
     #chat {
         height: 1fr;
@@ -123,33 +180,50 @@ class TeaParty(App):
     #seed-input {
         dock: bottom;
     }
-    #human-input {
+    ChatInput {
         dock: bottom;
-        border-top: solid $accent;
-        padding: 0 1;
+        height: 3;
+        max-height: 14;
     }
     """
 
     BINDINGS = [
-        Binding("space", "toggle_pause", "Pause/Resume", show=True),
-        Binding("ctrl+n", "interrupt", "Next Speaker", show=True),
-        Binding("ctrl+r", "randomize_next", "Random Next", show=True),
-        Binding("q", "quit_app", "Quit", show=True),
+        Binding("ctrl+p", "toggle_pause", "Pause/Resume", show=True, priority=True),
+        Binding("ctrl+n", "interrupt", "Next Speaker", show=True, priority=True),
+        Binding("ctrl+r", "randomize_next", "Random Next", show=True, priority=True),
+        Binding("ctrl+q", "quit_app", "Quit", show=True, priority=True),
     ]
 
-    def __init__(self):
+    def __init__(self, config: AppConfig) -> None:
         super().__init__()
-        self._conversation_started = False
-        self._is_paused = False
+        self._models: list[str] = config.models
+        self._client: OpenAI = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=config.api_key,
+        )
+        self._conversation_started: bool = False
+        self._is_paused: bool = False
         self._speaking: str | None = None
         self._next_override: str | None = None
-        self._turn = 0
-        self._tps: float | None = SPEED_DEFAULT  # None = no limit, 0 = frozen
-        self._interrupted = threading.Event()
-        self._pause_gate = threading.Event()
+        self._turn: int = 0
+        self._tps: float | None = None  # None = unlimited, 0 = frozen
+        self._speed_cond: threading.Condition = threading.Condition()
+        self._interrupted: threading.Event = threading.Event()
+        self._pause_gate: threading.Event = threading.Event()
         self._pause_gate.set()  # start unpaused (gate open)
-        self._human_ready = threading.Event()
-        self._human_text = ""
+        self._human_ready: threading.Event = threading.Event()
+        self._human_text: str = ""
+
+    # ── Model helpers ─────────────────────────────────────────────
+
+    def _color_for(self, model_id: str) -> str:
+        idx = self._models.index(model_id) if model_id in self._models else 0
+        return MODEL_COLORS[idx % len(MODEL_COLORS)]
+
+    def _speaker_for(self, model_id: str) -> tuple[str, str]:
+        return short_name(model_id), self._color_for(model_id)
+
+    # ── Compose & lifecycle ───────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield VerticalScroll(id="chat")
@@ -158,19 +232,22 @@ class TeaParty(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        # Show model list in chat
         chat = self.query_one("#chat")
         lines = Text()
         lines.append("Participants:\n", style="bold")
-        for i, m in enumerate(MODELS):
-            c = color_for(m)
+        for i, m in enumerate(self._models):
+            c = self._color_for(m)
             lines.append(f"  {i + 1}. {short_name(m)}\n", style=c)
-        lines.append("\nPress a number key during conversation to pick who speaks next.\n", style="dim")
-        info = Static(lines, classes="model-list")
-        chat.mount(info)
+        lines.append(
+            "\nPress Ctrl+number during conversation to pick who speaks next.\n",
+            style="dim",
+        )
+        chat.mount(Static(lines, classes="model-list"))
 
         self.query_one("#seed-input").focus()
         self._refresh_status()
+
+    # ── Event handlers ────────────────────────────────────────────
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "seed-input":
@@ -181,47 +258,56 @@ class TeaParty(App):
             self._conversation_started = True
             self._refresh_status()
             self._run_conversation(seed)
-        elif event.input.id == "human-input":
-            text = event.value.strip()
-            if not text:
-                return
-            self._human_text = text
-            self._human_ready.set()
-            event.input.remove()
 
-    def on_key(self, event) -> None:
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
+        self._human_text = event.value
+        self._human_ready.set()
+        for w in self.query("#human-input"):
+            w.remove()
+
+    def on_key(self, event: Key) -> None:
         if not self._conversation_started:
             return
-        # Don't intercept keys when human input is active
-        if self.query("#human-input"):
+        # Ctrl+number for model selection — works even during text input
+        for i in range(1, 10):
+            if event.key == f"ctrl+{i}":
+                idx = i - 1
+                if idx < len(self._models):
+                    self._next_override = self._models[idx]
+                    self._refresh_status()
+                    event.prevent_default()
+                return
+        # Speed controls — only when not in text input
+        if self.query("#human-input") or self.query("#seed-input"):
             return
-        if event.character and event.character in "123456789":
-            idx = int(event.character) - 1
-            if idx < len(MODELS):
-                self._next_override = MODELS[idx]
-                self._refresh_status()
-        elif event.character:
-            speed_keys = {"]": 1, "[": -1, "\\": 0}
+        if event.character:
+            speed_keys: dict[str, int] = {"]": 1, "[": -1, "\\": 0}
             if event.character in speed_keys:
                 self._adjust_speed(speed_keys[event.character])
 
+    # ── Speed control ─────────────────────────────────────────────
+
     def _adjust_speed(self, direction: int) -> None:
-        """direction: +1 = faster, -1 = slower, 0 = unlimited"""
-        if direction == 0:
-            self._tps = None
-        elif direction == 1 and self._tps is not None:
-            if self._tps == 0:
-                self._tps = SPEED_MIN
-            else:
-                new = self._tps * SPEED_FACTOR
-                self._tps = None if new > SPEED_MAX else new
-        elif direction == -1 and self._tps != 0:
-            if self._tps is None:
-                self._tps = SPEED_MAX
-            else:
-                new = self._tps / SPEED_FACTOR
-                self._tps = 0 if new < SPEED_MIN else new
+        """*direction*: ``+1`` = faster, ``-1`` = slower, ``0`` = unlimited."""
+        with self._speed_cond:
+            if direction == 0:
+                self._tps = None
+            elif direction == 1 and self._tps is not None:
+                if self._tps == 0:
+                    self._tps = SPEED_MIN
+                else:
+                    new = self._tps * SPEED_FACTOR
+                    self._tps = None if new > SPEED_MAX else new
+            elif direction == -1 and self._tps != 0:
+                if self._tps is None:
+                    self._tps = SPEED_MAX
+                else:
+                    new = self._tps / SPEED_FACTOR
+                    self._tps = 0 if new < SPEED_MIN else new
+            self._speed_cond.notify_all()
         self._refresh_status()
+
+    # ── Actions ───────────────────────────────────────────────────
 
     def action_toggle_pause(self) -> None:
         if not self._conversation_started:
@@ -237,7 +323,8 @@ class TeaParty(App):
         if not self._conversation_started:
             return
         self._interrupted.set()
-        # Also unpause if paused, so it moves on
+        with self._speed_cond:
+            self._speed_cond.notify_all()
         if self._is_paused:
             self._is_paused = False
             self._pause_gate.set()
@@ -250,17 +337,16 @@ class TeaParty(App):
         self._refresh_status()
 
     def action_quit_app(self) -> None:
-        # Don't quit if human input or seed input is focused — q is a letter
-        if self.query("#human-input") or self.query("#seed-input"):
-            return
-        # Unblock any waiting threads so they can see cancellation
         self._interrupted.set()
+        with self._speed_cond:
+            self._speed_cond.notify_all()
         self._pause_gate.set()
         self._human_ready.set()
         self.exit()
 
+    # ── Status bar ────────────────────────────────────────────────
+
     def _refresh_status(self) -> None:
-        # Line 1: state + speed
         state_parts: list[str] = []
 
         if self._is_paused:
@@ -271,15 +357,16 @@ class TeaParty(App):
             state_parts.append("▶  running")
 
         if self._next_override:
-            c = color_for(self._next_override)
-            state_parts.append(f"🎯 next → [{c}]{short_name(self._next_override)}[/{c}]")
+            c = self._color_for(self._next_override)
+            state_parts.append(
+                f"🎯 next → [{c}]{short_name(self._next_override)}[/{c}]"
+            )
         else:
             state_parts.append("🔄 auto")
 
         state_parts.append(f"turn {self._turn}")
 
-        # Speed display
-        hint = "[dim]\\[slow \\]fast \\\\unlim[/dim]"
+        hint = "[dim]\\[slow ]fast \\unlim[/dim]"
         if self._tps is None:
             speed = "unlimited"
         elif self._tps == 0:
@@ -290,17 +377,18 @@ class TeaParty(App):
 
         line1 = " │ ".join(state_parts)
 
-        # Line 2: model keys
-        model_keys = "  ".join(
-            f"[{c}]{i+1}={short_name(m)}[/{c}]"
-            for i, m in enumerate(MODELS)
-            for c in (color_for(m),)
-        )
+        parts: list[str] = []
+        for i, m in enumerate(self._models):
+            c = self._color_for(m)
+            parts.append(f"[{c}]^{i + 1}={short_name(m)}[/{c}]")
+        model_keys = "  ".join(parts)
 
         try:
             self.query_one("#status", StatusBar).update(f"{line1}\n{model_keys}")
-        except Exception:
-            pass
+        except NoMatches:
+            logger.debug("Status bar widget not found")
+
+    # ── Widget helpers ────────────────────────────────────────────
 
     def _mount_message(self, widget: Static) -> None:
         chat = self.query_one("#chat")
@@ -312,23 +400,34 @@ class TeaParty(App):
             w = self.query_one(f"#{widget_id}", Static)
             w.update(content)
             self.query_one("#chat").scroll_end(animate=False)
-        except Exception:
-            pass
+        except NoMatches:
+            logger.debug("Widget #%s not found for update", widget_id)
 
-    def _update_prefixed(self, widget_id: str, name: str, color: str, body: str, **kw) -> None:
-        self.call_from_thread(self._update_message, widget_id, _prefixed_text(name, color, body, **kw))
+    def _update_prefixed(
+        self, widget_id: str, name: str, color: str, body: str, **kw: str
+    ) -> None:
+        self.call_from_thread(
+            self._update_message, widget_id, _prefixed_text(name, color, body, **kw)
+        )
 
     def _show_human_input(self) -> None:
-        inp = Input(placeholder="Your turn — type your message…", id="human-input")
-        self.mount(inp, after=self.query_one("#status"))
+        inp = ChatInput(id="human-input", soft_wrap=True)
+        self.mount(inp, before=self.query_one("#status"))
         inp.focus()
 
     def _hide_human_input(self) -> None:
         for w in self.query("#human-input"):
             w.remove()
 
-    def _wait_or_cancel(self, event: threading.Event, worker, also_break_on: threading.Event | None = None) -> str:
-        """Block until event is set. Returns 'ready', 'cancelled', or 'interrupted'."""
+    # ── Concurrency helpers ───────────────────────────────────────
+
+    def _wait_or_cancel(
+        self,
+        event: threading.Event,
+        worker: Worker,
+        also_break_on: threading.Event | None = None,
+    ) -> str:
+        """Block until *event* is set. Returns ``'ready'``, ``'cancelled'``, or ``'interrupted'``."""
         while not event.wait(timeout=0.3):
             if worker.is_cancelled:
                 return "cancelled"
@@ -336,18 +435,21 @@ class TeaParty(App):
                 return "interrupted"
         return "ready"
 
+    # ── Conversation loop ─────────────────────────────────────────
+
     @work(thread=True)
     def _run_conversation(self, seed: str) -> None:
+        """Main conversation loop (runs in a Textual worker thread)."""
         worker = get_current_worker()
 
-        model_names = ", ".join(short_name(m) for m in MODELS)
+        model_names = ", ".join(short_name(m) for m in self._models)
         intro = (
             f"You are all in a group conversation together. "
             f"The participants are: {model_names}. "
             f"Most of you are AI models, but 'you' is a human participant. "
             f"A human has set up this room for everyone to chat. Here's the topic:\n\n{seed}"
         )
-        history: list[tuple[str | None, str]] = [(None, intro)]
+        history: list[Turn] = [Turn(speaker=None, content=intro)]
         last_model: str | None = None
 
         system_tmpl = (
@@ -362,21 +464,19 @@ class TeaParty(App):
         )
 
         while not worker.is_cancelled:
-            # Pause gate — blocks while paused
             if self._wait_or_cancel(self._pause_gate, worker) == "cancelled":
                 return
 
             self._interrupted.clear()
             self._turn += 1
 
-            # Pick model
             override = self._next_override
             self._next_override = None
 
             if override and override != last_model:
                 model = override
             else:
-                candidates = [m for m in MODELS if m != last_model]
+                candidates = [m for m in self._models if m != last_model]
                 model = random.choice(candidates)
 
             self._speaking = short_name(model)
@@ -387,82 +487,111 @@ class TeaParty(App):
             if model == HUMAN:
                 last_model = self._handle_human_turn(worker, model, widget_id, history)
             else:
-                last_model = self._handle_ai_turn(model, widget_id, history, system_tmpl)
+                last_model = self._handle_ai_turn(
+                    model, widget_id, history, system_tmpl
+                )
 
             self._speaking = None
             self.call_from_thread(self._refresh_status)
 
-    def _handle_human_turn(self, worker, model, widget_id, history) -> str:
-        name, color = _speaker(model)
+    def _handle_human_turn(
+        self,
+        worker: Worker,
+        model: str,
+        widget_id: str,
+        history: list[Turn],
+    ) -> str:
+        """Handle a human participant's turn."""
+        name, color = self._speaker_for(model)
         waiting_widget = Static(
             _prefixed_text(name, color, "waiting for input…", body_style="dim italic"),
-            classes="message", id=widget_id,
+            classes="message",
+            id=widget_id,
         )
         self.call_from_thread(self._mount_message, waiting_widget)
         self.call_from_thread(self._show_human_input)
 
         self._human_ready.clear()
-        result = self._wait_or_cancel(self._human_ready, worker, also_break_on=self._interrupted)
+        result = self._wait_or_cancel(
+            self._human_ready, worker, also_break_on=self._interrupted
+        )
 
         if result == "cancelled":
             return model
-        elif result == "interrupted":
+        if result == "interrupted":
             self.call_from_thread(self._hide_human_input)
             self._update_prefixed(widget_id, name, color, "(skipped)")
             return model
 
-        # Got human input
         response_text = self._human_text
         self._update_prefixed(widget_id, name, color, response_text)
-        history.append((model, f"[{name}]: {response_text}"))
+        history.append(Turn(speaker=model, content=f"[{name}]: {response_text}"))
         return model
 
-    def _handle_ai_turn(self, model, widget_id, history, system_tmpl) -> str:
-        name, color = _speaker(model)
-        others = ", ".join(short_name(m) for m in MODELS if m != model)
+    def _handle_ai_turn(
+        self,
+        model: str,
+        widget_id: str,
+        history: list[Turn],
+        system_tmpl: str,
+    ) -> str:
+        """Handle an AI model's turn with streaming response."""
+        name, color = self._speaker_for(model)
+        others = ", ".join(short_name(m) for m in self._models if m != model)
         system_msg = system_tmpl.format(name=name, others=others)
 
-        full_messages: list[dict] = [{"role": "system", "content": system_msg}]
-        for speaker, content in history:
-            role = "assistant" if speaker == model else "user"
-            full_messages.append({"role": role, "content": content})
+        full_messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_msg}
+        ]
+        for turn in history:
+            role = "assistant" if turn.speaker == model else "user"
+            full_messages.append({"role": role, "content": turn.content})
 
         # Merge consecutive same-role messages
-        merged: list[dict] = []
+        merged: list[dict[str, str]] = []
         for msg in full_messages:
             if merged and merged[-1]["role"] == msg["role"]:
                 merged[-1]["content"] += "\n\n" + msg["content"]
             else:
                 merged.append(dict(msg))
 
-        # Mount thinking widget
         thinking_widget = Static(
             _prefixed_text(name, color, "thinking…", body_style="dim italic"),
-            classes="message", id=widget_id,
+            classes="message",
+            id=widget_id,
         )
         self.call_from_thread(self._mount_message, thinking_widget)
 
-        # Stream response with buffered playback
         rendered_text, was_interrupted = self._stream(model, merged, widget_id)
 
         if rendered_text:
             suffix = "—" if was_interrupted else ""
-            history.append((model, f"[{name}]: {rendered_text}{suffix}"))
+            history.append(
+                Turn(speaker=model, content=f"[{name}]: {rendered_text}{suffix}")
+            )
             self._update_prefixed(widget_id, name, color, rendered_text, suffix=suffix)
 
         return model
 
-    def _stream(self, model: str, messages: list[dict], widget_id: str) -> tuple[str, bool]:
-        name, color = _speaker(model)
+    def _stream(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        widget_id: str,
+    ) -> tuple[str, bool]:
+        """Stream a model response with speed-controlled playback.
+
+        Returns ``(rendered_text, was_interrupted)``.
+        """
+        name, color = self._speaker_for(model)
 
         token_buf: queue.Queue[str] = queue.Queue()
         stream_done = threading.Event()
-        stream_error: list[Exception | None] = [None]
+        state = SimpleNamespace(error=None)
 
-        # ── Producer: fills buffer from API at full speed ─────────────
-        def producer():
+        def producer() -> None:
             try:
-                stream = client.chat.completions.create(
+                stream = self._client.chat.completions.create(
                     model=model,
                     messages=messages,
                     stream=True,
@@ -474,19 +603,18 @@ class TeaParty(App):
                         break
                     if chunk.choices and chunk.choices[0].delta.content:
                         token_buf.put(chunk.choices[0].delta.content)
-            except Exception as e:
-                stream_error[0] = e
+            except Exception as exc:
+                state.error = exc
             finally:
                 stream_done.set()
 
         producer_thread = threading.Thread(target=producer, daemon=True)
         producer_thread.start()
 
-        # ── Consumer: renders from buffer at controlled speed ─────────
+        # Consumer: render from buffer at controlled speed
         rendered_text = ""
         was_interrupted = False
         last_render = 0.0
-        MIN_RENDER_INTERVAL = 1.0 / 30  # cap UI updates at ~30fps
 
         while True:
             if self._interrupted.is_set():
@@ -502,7 +630,6 @@ class TeaParty(App):
 
             rendered_text += token
 
-            # Throttle UI updates to avoid overwhelming Textual
             now = time.monotonic()
             if now - last_render >= MIN_RENDER_INTERVAL:
                 self._update_prefixed(widget_id, name, color, rendered_text)
@@ -510,37 +637,61 @@ class TeaParty(App):
 
             # Speed-controlled delay between tokens
             if self._tps is None:
-                pass  # no limit
+                pass  # unlimited
             elif self._tps == 0:
-                # Frozen — wait until speed changes or interrupted
-                while self._tps == 0 and not self._interrupted.is_set():
-                    time.sleep(0.05)
+                with self._speed_cond:
+                    while self._tps == 0 and not self._interrupted.is_set():
+                        self._speed_cond.wait()
             else:
                 time.sleep(1.0 / self._tps)
 
-        # Wait for producer to finish (it will stop on interrupt or naturally)
         producer_thread.join(timeout=2.0)
 
-        # Handle errors
-        if stream_error[0] and not rendered_text:
-            self._update_prefixed(widget_id, name, color, f"Error: {stream_error[0]}", body_style="red")
+        if state.error and not rendered_text:
+            self._update_prefixed(
+                widget_id, name, color, f"Error: {state.error}", body_style="red"
+            )
             return "", False
 
-        # Final render to make sure everything rendered is visible
         if rendered_text:
-            self._update_prefixed(widget_id, name, color, rendered_text, suffix="…" if was_interrupted else "")
-        elif not stream_error[0]:
-            self._update_prefixed(widget_id, name, color, "(empty response)", body_style="dim")
+            self._update_prefixed(
+                widget_id,
+                name,
+                color,
+                rendered_text,
+                suffix="…" if was_interrupted else "",
+            )
+        elif not state.error:
+            self._update_prefixed(
+                widget_id, name, color, "(empty response)", body_style="dim"
+            )
 
         return rendered_text, was_interrupted
 
 
-if __name__ == "__main__":
-    if not OPENROUTER_API_KEY:
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    """Load configuration, validate, and run the application."""
+    raw = _load_config()
+    if "models" not in raw:
+        print("config.json must contain a 'models' array.")
+        sys.exit(1)
+
+    models = [m for m in raw["models"] if m != HUMAN] + [HUMAN]
+    api_key: str = raw.get("apiToken") or os.environ.get("OPENROUTER_API_KEY") or ""
+
+    if not api_key:
         print("Set apiToken in config.json or OPENROUTER_API_KEY env var.")
         sys.exit(1)
-    app = TeaParty()
+
+    app = TeaParty(AppConfig(models=models, api_key=api_key))
     try:
         app.run()
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    main()
