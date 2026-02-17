@@ -22,7 +22,7 @@ from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key
 from textual.geometry import Region
 from textual.message import Message
@@ -73,6 +73,10 @@ class Turn(NamedTuple):
 class AppConfig(NamedTuple):
     models: list[str]
     clients: dict[str, OpenAI]  # model_id -> OpenAI client
+    moderator: str | None  # model ID for the interrupt moderator
+    moderator_client: OpenAI | None  # client for the moderator model
+    intros: bool  # collect personality bios before conversation
+    interrupts: bool  # collect interrupt triggers (requires moderator)
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -193,6 +197,9 @@ class TeaParty(App):
     ENABLE_COMMAND_PALETTE = False
 
     CSS = """
+    #main-area {
+        height: 1fr;
+    }
     #chat {
         height: 1fr;
     }
@@ -223,6 +230,21 @@ class TeaParty(App):
         max-height: 14;
         margin-bottom: 1;
     }
+    #moderator-panel {
+        width: 44;
+        height: 1fr;
+        border-left: tall $accent;
+        display: none;
+        overflow-y: auto;
+        padding: 0 1;
+    }
+    #moderator-panel.visible {
+        display: block;
+    }
+    .mod-entry {
+        padding: 0;
+        margin: 0 0 1 0;
+    }
     """
 
     BINDINGS = [
@@ -244,6 +266,7 @@ class TeaParty(App):
             show=True,
             priority=True,
         ),
+        Binding("ctrl+m", "toggle_moderator", "Moderator", show=True, priority=True),
         Binding("ctrl+q", "quit_app", "Quit", show=True, priority=True),
     ]
 
@@ -251,8 +274,12 @@ class TeaParty(App):
         super().__init__()
         self._models: list[str] = config.models
         self._clients: dict[str, OpenAI] = config.clients
+        self._moderator_model: str | None = config.moderator
+        self._moderator_client: OpenAI | None = config.moderator_client
+        self._intros_enabled: bool = config.intros
+        self._interrupts_enabled: bool = config.interrupts
         self._conversation_started: bool = False
-        self._generating_bios: bool = False
+        self._setup_status: str | None = None
         self._is_paused: bool = True
         self._speaking: str | None = None
         self._next_override: str | None = None
@@ -271,6 +298,8 @@ class TeaParty(App):
         self._rewind_mode: bool = False
         self._rewind_index: int = 0
         self._was_paused_before_rewind: bool = True
+        self._interrupt_triggers: dict[str, list[str]] = {}
+        self._model_interrupted_by: str | None = None
 
     # ── Model helpers ─────────────────────────────────────────────
 
@@ -283,7 +312,11 @@ class TeaParty(App):
     # ── Compose & lifecycle ───────────────────────────────────────
 
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="chat")
+        with Horizontal(id="main-area"):
+            yield VerticalScroll(id="chat")
+            panel = VerticalScroll(id="moderator-panel")
+            panel.border_title = "Moderator"
+            yield panel
         yield ChatInput(
             placeholder="Enter seed prompt…",
             id="seed-input",
@@ -521,6 +554,11 @@ class TeaParty(App):
                 self._next_override = None
         self._refresh_status()
 
+    def action_toggle_moderator(self) -> None:
+        """Toggle the moderator side panel."""
+        panel = self.query_one("#moderator-panel")
+        panel.toggle_class("visible")
+
     def action_quit_app(self) -> None:
         self._interrupted.set()
         with self._speed_cond:
@@ -536,8 +574,8 @@ class TeaParty(App):
 
         if not self._conversation_started:
             state_parts.append("✏️  enter seed prompt")
-        elif self._generating_bios:
-            state_parts.append("🪪 generating bios…")
+        elif self._setup_status:
+            state_parts.append(self._setup_status)
         elif self._speaking:
             state_parts.append(f"💬 {self._speaking}")
         else:
@@ -645,12 +683,20 @@ class TeaParty(App):
         model_names = ", ".join(short_name(m) for m in self._models)
 
         # Collect intro bios from all AI models in parallel (streamed live)
-        bios = self._collect_bios(model_names, seed)
-        if worker.is_cancelled:
-            return
+        bios: dict[str, str] = {}
+        if self._intros_enabled:
+            bios = self._collect_bios(model_names, seed)
+            if worker.is_cancelled:
+                return
+
+        # Collect interrupt triggers if moderator is configured
+        if self._interrupts_enabled and self._moderator_model:
+            self._interrupt_triggers = self._collect_triggers(bios)
+            if worker.is_cancelled:
+                return
 
         bio_lines = "\n".join(f"- {short_name(m)}: {bio}" for m, bio in bios.items())
-        bio_block = f"Introductions:\n{bio_lines}"
+        bio_block = f"Introductions:\n{bio_lines}" if bios else ""
 
         seed_widget = Static(
             Text.from_markup(f"[bold]Topic:[/bold] {seed}"),
@@ -660,7 +706,7 @@ class TeaParty(App):
         self.call_from_thread(self._mount_message, seed_widget)
 
         intro = (
-            f"{bio_block}\n\n"
+            f"{bio_block + chr(10) + chr(10) if bio_block else ''}"
             f"You are all in a group conversation together. "
             f"The participants are: {model_names}. "
             f"All of you, except 'human', are AI models. "
@@ -725,7 +771,7 @@ class TeaParty(App):
         """Fetch a short bio from each AI model, streamed live in parallel."""
         ai_models = [m for m in self._models if m != HUMAN]
 
-        self._generating_bios = True
+        self._setup_status = "🪪 generating bios…"
         self.call_from_thread(self._refresh_status)
 
         # Create bordered container for bios
@@ -828,11 +874,87 @@ class TeaParty(App):
         for t in threads:
             t.join()
 
-        self._generating_bios = False
+        self._setup_status = None
         self.call_from_thread(self._refresh_status)
 
         # Preserve model order (AI models first, then human)
         return {m: bios[m] for m in ai_models + [HUMAN]}
+
+    def _collect_triggers(self, bios: dict[str, str]) -> dict[str, list[str]]:
+        """Ask each AI model for interrupt triggers. Returns {model_id: [trigger, ...]}."""
+        ai_models = [m for m in self._models if m != HUMAN]
+
+        self._setup_status = "🎯 collecting triggers…"
+        self.call_from_thread(self._refresh_status)
+
+        trigger_prompt = (
+            "You're about to join a group conversation. "
+            "List 3-5 short phrases describing moments where you'd be eager to jump in — "
+            "topics that excite you, areas where you have something interesting to add, "
+            "things that spark your curiosity or where you just can't help but contribute. "
+            "Keep each phrase under 8 words. One per line, nothing else."
+        )
+
+        triggers: dict[str, list[str]] = {}
+        lock = threading.Lock()
+
+        def fetch_triggers(model: str) -> None:
+            name = short_name(model)
+            bio = bios.get(model, "")
+            try:
+                resp = self._clients[model].chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": f"You are {name}. Your personality: {bio}",
+                        },
+                        {"role": "user", "content": trigger_prompt},
+                    ],
+                    timeout=30.0,
+                )
+                raw = (resp.choices[0].message.content or "").strip()
+                # Parse lines, strip bullets/numbers
+                lines = []
+                for line in raw.splitlines():
+                    line = line.strip()
+                    line = line.lstrip("0123456789.-•*) ").strip()
+                    if line:
+                        lines.append(line)
+                with lock:
+                    triggers[model] = lines[:5]
+            except Exception as exc:
+                logger.warning("Failed to collect triggers from %s: %s", name, exc)
+                with lock:
+                    triggers[model] = []
+
+        threads = [
+            threading.Thread(target=fetch_triggers, args=(m,), daemon=True)
+            for m in ai_models
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Update bio widgets to show triggers (only if intros were collected)
+        if self._intros_enabled:
+            for i, model in enumerate(ai_models):
+                model_triggers = triggers.get(model, [])
+                if model_triggers:
+                    name, color = self._speaker_for(model)
+                    bio_text = bios.get(model, "")
+                    trigger_line = " · ".join(model_triggers)
+                    t = _prefixed_text(name, color, bio_text)
+                    t.append(
+                        f"\n  ↳ interrupts when: {trigger_line}", style="dim italic"
+                    )
+                    self.call_from_thread(self._update_message, f"bio-{i}", t)
+
+        self._setup_status = None
+        self.call_from_thread(self._refresh_status)
+
+        return triggers
 
     def _handle_human_turn(
         self,
@@ -980,21 +1102,36 @@ class TeaParty(App):
             elif tc["name"] == "skip":
                 skipped = True
 
+        interrupter = self._model_interrupted_by
+        self._model_interrupted_by = None
+
         if skipped and not rendered_text:
             self._update_prefixed(widget_id, name, color, "(passed)", body_style="dim")
             self._history.append(Turn(speaker=model, content=f"[{name}]: (passed)"))
         elif rendered_text:
             suffix = "—" if was_interrupted else ""
+            interrupt_note = ""
+            if was_interrupted and interrupter:
+                interrupt_note = f" [interrupted by {interrupter}]"
             self._history.append(
-                Turn(speaker=model, content=f"[{name}]: {rendered_text}{suffix}")
+                Turn(
+                    speaker=model,
+                    content=f"[{name}]: {rendered_text}{suffix}{interrupt_note}",
+                )
             )
             self._update_prefixed(widget_id, name, color, rendered_text, suffix=suffix)
         elif was_interrupted:
+            interrupt_note = ""
+            if interrupter:
+                interrupt_note = f" [interrupted by {interrupter}]"
             self._update_prefixed(
                 widget_id, name, color, "(interrupted)", body_style="dim"
             )
             self._history.append(
-                Turn(speaker=model, content=f"[{name}]: (interrupted)")
+                Turn(
+                    speaker=model,
+                    content=f"[{name}]: (interrupted){interrupt_note}",
+                )
             )
 
         return model
@@ -1014,7 +1151,7 @@ class TeaParty(App):
 
         token_buf: queue.Queue[str] = queue.Queue()
         stream_done = threading.Event()
-        state = SimpleNamespace(error=None, tool_calls={})
+        state = SimpleNamespace(error=None, tool_calls={}, rendered_text="")
 
         def producer() -> None:
             try:
@@ -1053,6 +1190,130 @@ class TeaParty(App):
         producer_thread = threading.Thread(target=producer, daemon=True)
         producer_thread.start()
 
+        # ── Interrupt monitor thread ──────────────────────────────
+        mod_client = self._moderator_client
+        mod_model = self._moderator_model
+        mod_log_counter = 0
+
+        def _log_mod(entry: Text) -> None:
+            nonlocal mod_log_counter
+            mod_log_counter += 1
+            w = Static(
+                entry, classes="mod-entry", id=f"mod-{widget_id}-{mod_log_counter}"
+            )
+            panel = self.query_one("#moderator-panel", VerticalScroll)
+            panel.mount(w)
+            panel.scroll_end(animate=False)
+
+        def monitor() -> None:
+            """Watch rendered text for interrupt-trigger matches via the moderator model."""
+            assert mod_client is not None and mod_model is not None
+            other_triggers = {
+                m: trigs
+                for m, trigs in self._interrupt_triggers.items()
+                if m != model and trigs
+            }
+            if not other_triggers:
+                return
+
+            trigger_list = "\n".join(
+                f"- {short_name(m)}: {', '.join(trigs)}"
+                for m, trigs in other_triggers.items()
+            )
+
+            last_checked_len = 0
+            min_new_chars = 80  # wait for enough new content
+            min_interval = 1.5  # seconds between checks
+            last_check_time = 0.0
+
+            # Log session header
+            header = Text()
+            header.append(f"── {name} speaking ──", style="dim bold")
+            self.call_from_thread(_log_mod, header)
+
+            while not stream_done.is_set() and not self._interrupted.is_set():
+                time.sleep(0.2)
+                text = state.rendered_text
+                new_len = len(text) - last_checked_len
+
+                if new_len < min_new_chars:
+                    continue
+
+                now_mono = time.monotonic()
+                if now_mono - last_check_time < min_interval:
+                    continue
+
+                # Look for sentence boundary in new content
+                new_chunk = text[last_checked_len:]
+                has_boundary = any(c in new_chunk for c in ".!?\n")
+                if not has_boundary and new_len < 200:
+                    continue
+
+                last_checked_len = len(text)
+                last_check_time = now_mono
+
+                # Use last ~300 chars for context (keep prompt small)
+                context = text[-300:] if len(text) > 300 else text
+                # Snippet for the log (last ~60 chars)
+                snippet = context[-60:].replace("\n", " ")
+                if len(context) > 60:
+                    snippet = "…" + snippet
+
+                monitor_prompt = (
+                    f"You are monitoring a group conversation for interrupt triggers.\n"
+                    f"Current speaker: {name}\n\n"
+                    f"Interrupt triggers for other participants:\n{trigger_list}\n\n"
+                    f'Recent text from {name}:\n"{context}"\n\n'
+                    f"Does the text clearly match any participant's interrupt trigger? "
+                    f"Only match if it's strong and obvious. "
+                    f"Reply with ONLY the participant name exactly as listed, or NONE."
+                )
+
+                try:
+                    resp = mod_client.chat.completions.create(
+                        model=mod_model,
+                        messages=[{"role": "user", "content": monitor_prompt}],
+                        max_tokens=10,
+                        temperature=0,
+                        timeout=5.0,
+                    )
+                    result = (resp.choices[0].message.content or "").strip()
+
+                    # Log the check result
+                    entry = Text()
+                    entry.append(f'"{snippet}"\n', style="dim")
+                    if result and result != "NONE":
+                        entry.append(f"  → {result} ⚡", style="bold bright_yellow")
+                    else:
+                        entry.append("  → NONE", style="dim")
+                    self.call_from_thread(_log_mod, entry)
+
+                    if result and result != "NONE":
+                        # Match against known participant names
+                        for m in other_triggers:
+                            if short_name(m) == result:
+                                if not stream_done.is_set():
+                                    self._model_interrupted_by = short_name(m)
+                                    self._next_override = m
+                                    self._interrupted.set()
+                                    with self._speed_cond:
+                                        self._speed_cond.notify_all()
+                                break
+                except Exception as exc:
+                    # Log errors too
+                    err_entry = Text()
+                    err_entry.append(f'"{snippet}"\n', style="dim")
+                    err_entry.append(f"  → error: {exc}", style="dim red")
+                    self.call_from_thread(_log_mod, err_entry)
+
+                if self._interrupted.is_set():
+                    break
+
+        monitor_thread: threading.Thread | None = None
+        if mod_client and mod_model and self._interrupt_triggers:
+            monitor_thread = threading.Thread(target=monitor, daemon=True)
+            monitor_thread.start()
+
         # Consumer: render from buffer at controlled speed
         rendered_text = ""
         was_interrupted = False
@@ -1071,6 +1332,7 @@ class TeaParty(App):
                 continue
 
             rendered_text += token
+            state.rendered_text = rendered_text
 
             now = time.monotonic()
             if now - last_render >= MIN_RENDER_INTERVAL:
@@ -1087,7 +1349,13 @@ class TeaParty(App):
             else:
                 time.sleep(1.0 / self._tps)
 
+        if was_interrupted:
+            # Don't wait — daemon threads will clean up on their own
+            return rendered_text, True, []
+
         producer_thread.join()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=6.0)
 
         parsed_tool_calls = list(state.tool_calls.values())
 
@@ -1160,7 +1428,33 @@ def main() -> None:
 
     all_models.append(HUMAN)
 
-    app = TeaParty(AppConfig(models=all_models, clients=clients))
+    # Parse optional moderator config
+    moderator_model: str | None = None
+    moderator_client: OpenAI | None = None
+    mod_cfg = raw.get("moderator")
+    if mod_cfg and isinstance(mod_cfg, dict):
+        mod_url = mod_cfg.get("url")
+        mod_token = mod_cfg.get("token", "")
+        mod_model = mod_cfg.get("model", "")
+        if not mod_url or not mod_token or not mod_model:
+            print("Moderator config requires 'url', 'token', and 'model'.")
+            sys.exit(1)
+        moderator_model = mod_model
+        moderator_client = OpenAI(base_url=mod_url, api_key=mod_token)
+
+    intros_enabled = raw.get("intros", True)
+    interrupts_enabled = raw.get("interrupts", True)
+
+    app = TeaParty(
+        AppConfig(
+            models=all_models,
+            clients=clients,
+            moderator=moderator_model,
+            moderator_client=moderator_client,
+            intros=intros_enabled,
+            interrupts=interrupts_enabled,
+        )
+    )
     try:
         app.run()
     except KeyboardInterrupt:

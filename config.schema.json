@@ -7,6 +7,39 @@
       "type": "string",
       "description": "Optional path or URL to this schema for editor validation."
     },
+    "intros": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to collect personality bios from each model before the conversation starts. Defaults to true."
+    },
+    "interrupts": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether to collect interrupt triggers from each model (requires a moderator to be configured). Defaults to true."
+    },
+    "moderator": {
+      "type": "object",
+      "description": "A fast, cheap model that watches the conversation stream and decides when another participant should interrupt the current speaker. Each participant declares 'interrupt triggers' at the start; the moderator watches for matches in real time.",
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Base URL of the OpenAI-compatible API for the moderator model."
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1,
+          "description": "API authentication token for the moderator provider."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model ID for the moderator (e.g. \"meta-llama/llama-3.1-8b-instruct\")."
+        }
+      },
+      "required": ["url", "token", "model"],
+      "additionalProperties": false
+    },
     "providers": {
       "type": "array",
       "minItems": 1,
