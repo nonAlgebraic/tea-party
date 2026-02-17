@@ -880,12 +880,24 @@ class TeaParty(App):
         # Preserve model order (AI models first, then human)
         return {m: bios[m] for m in ai_models + [HUMAN]}
 
+    def _log_to_moderator_panel(self, entry: Text) -> None:
+        """Append a log entry to the moderator side panel."""
+        panel = self.query_one("#moderator-panel", VerticalScroll)
+        w = Static(entry, classes="mod-entry")
+        panel.mount(w)
+        panel.scroll_end(animate=False)
+
     def _collect_triggers(self, bios: dict[str, str]) -> dict[str, list[str]]:
         """Ask each AI model for interrupt triggers. Returns {model_id: [trigger, ...]}."""
         ai_models = [m for m in self._models if m != HUMAN]
 
         self._setup_status = "🎯 collecting triggers…"
         self.call_from_thread(self._refresh_status)
+
+        # Log header to moderator panel
+        header = Text()
+        header.append("── collecting triggers ──", style="dim bold")
+        self.call_from_thread(self._log_to_moderator_panel, header)
 
         trigger_prompt = (
             "You're about to join a group conversation. "
@@ -899,7 +911,7 @@ class TeaParty(App):
         lock = threading.Lock()
 
         def fetch_triggers(model: str) -> None:
-            name = short_name(model)
+            name, color = self._speaker_for(model)
             bio = bios.get(model, "")
             try:
                 resp = self._clients[model].chat.completions.create(
@@ -921,12 +933,25 @@ class TeaParty(App):
                     line = line.lstrip("0123456789.-•*) ").strip()
                     if line:
                         lines.append(line)
+                parsed = lines[:5]
                 with lock:
-                    triggers[model] = lines[:5]
+                    triggers[model] = parsed
+                # Log to moderator panel
+                entry = Text()
+                entry.append(f"[{name}] ", style=f"bold {color}")
+                if parsed:
+                    entry.append(" · ".join(parsed), style="dim")
+                else:
+                    entry.append("(none)", style="dim italic")
+                self.call_from_thread(self._log_to_moderator_panel, entry)
             except Exception as exc:
                 logger.warning("Failed to collect triggers from %s: %s", name, exc)
                 with lock:
                     triggers[model] = []
+                entry = Text()
+                entry.append(f"[{name}] ", style=f"bold {color}")
+                entry.append(f"error: {exc}", style="dim red")
+                self.call_from_thread(self._log_to_moderator_panel, entry)
 
         threads = [
             threading.Thread(target=fetch_triggers, args=(m,), daemon=True)
@@ -1193,17 +1218,6 @@ class TeaParty(App):
         # ── Interrupt monitor thread ──────────────────────────────
         mod_client = self._moderator_client
         mod_model = self._moderator_model
-        mod_log_counter = 0
-
-        def _log_mod(entry: Text) -> None:
-            nonlocal mod_log_counter
-            mod_log_counter += 1
-            w = Static(
-                entry, classes="mod-entry", id=f"mod-{widget_id}-{mod_log_counter}"
-            )
-            panel = self.query_one("#moderator-panel", VerticalScroll)
-            panel.mount(w)
-            panel.scroll_end(animate=False)
 
         def monitor() -> None:
             """Watch rendered text for interrupt-trigger matches via the moderator model."""
@@ -1229,7 +1243,7 @@ class TeaParty(App):
             # Log session header
             header = Text()
             header.append(f"── {name} speaking ──", style="dim bold")
-            self.call_from_thread(_log_mod, header)
+            self.call_from_thread(self._log_to_moderator_panel, header)
 
             while not stream_done.is_set() and not self._interrupted.is_set():
                 time.sleep(0.2)
@@ -1286,7 +1300,7 @@ class TeaParty(App):
                         entry.append(f"  → {result} ⚡", style="bold bright_yellow")
                     else:
                         entry.append("  → NONE", style="dim")
-                    self.call_from_thread(_log_mod, entry)
+                    self.call_from_thread(self._log_to_moderator_panel, entry)
 
                     if result and result != "NONE":
                         # Match against known participant names
@@ -1304,7 +1318,7 @@ class TeaParty(App):
                     err_entry = Text()
                     err_entry.append(f'"{snippet}"\n', style="dim")
                     err_entry.append(f"  → error: {exc}", style="dim red")
-                    self.call_from_thread(_log_mod, err_entry)
+                    self.call_from_thread(self._log_to_moderator_panel, err_entry)
 
                 if self._interrupted.is_set():
                     break
