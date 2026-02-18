@@ -32,6 +32,30 @@ from textual.worker import Worker, get_current_worker
 
 logger = logging.getLogger(__name__)
 
+# ── API request logger ───────────────────────────────────────────────────────
+api_logger = logging.getLogger("tea_party.api")
+api_logger.setLevel(logging.DEBUG)
+api_logger.propagate = False
+_api_log_handler = logging.FileHandler(
+    Path(__file__).parent / "tea_party.log", mode="w", encoding="utf-8"
+)
+_api_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+)
+api_logger.addHandler(_api_log_handler)
+
+
+def _log_api_request(label: str, model: str, **kwargs: object) -> None:
+    """Write the full request body for an API call to tea_party.log."""
+    body = {"model": model, **kwargs}
+    api_logger.debug(
+        "[%s] model=%s\n%s",
+        label,
+        model,
+        json.dumps(body, indent=2, default=str),
+    )
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 HUMAN = "human"
@@ -298,6 +322,7 @@ class TeaParty(App):
         self._rewind_mode: bool = False
         self._rewind_index: int = 0
         self._was_paused_before_rewind: bool = True
+        self._bios: dict[str, str] = {}
         self._interrupt_triggers: dict[str, list[str]] = {}
         self._model_interrupted_by: str | None = None
 
@@ -682,21 +707,22 @@ class TeaParty(App):
 
         model_names = ", ".join(short_name(m) for m in self._models)
 
-        # Collect intro bios from all AI models in parallel (streamed live)
+        # 1. Collect intro bios (models don't see the seed yet)
         bios: dict[str, str] = {}
         if self._intros_enabled:
             bios = self._collect_bios(model_names, seed)
             if worker.is_cancelled:
                 return
 
-        # Collect interrupt triggers if moderator is configured
+        # 2. Collect interrupt triggers (models see the seed + their own bio, but not others' bios)
         if self._interrupts_enabled and self._moderator_model:
-            self._interrupt_triggers = self._collect_triggers(bios)
+            self._interrupt_triggers = self._collect_triggers(seed, bios)
             if worker.is_cancelled:
                 return
 
-        bio_lines = "\n".join(f"- {short_name(m)}: {bio}" for m, bio in bios.items())
-        bio_block = f"Introductions:\n{bio_lines}" if bios else ""
+        # 3. Conversation starts — models see seed + participant list
+        #    (bios are injected per-model in _handle_ai_turn, excluding self)
+        self._bios = bios
 
         seed_widget = Static(
             Text.from_markup(f"[bold]Topic:[/bold] {seed}"),
@@ -706,7 +732,6 @@ class TeaParty(App):
         self.call_from_thread(self._mount_message, seed_widget)
 
         intro = (
-            f"{bio_block + chr(10) + chr(10) if bio_block else ''}"
             f"You are all in a group conversation together. "
             f"The participants are: {model_names}. "
             f"All of you, except 'human', are AI models. "
@@ -780,11 +805,8 @@ class TeaParty(App):
         self.call_from_thread(self._mount_message, bio_container)
 
         bio_prompt = (
-            f"You are about to join a group conversation. "
-            f"The participants are: {model_names}. "
-            f"All of you, except 'human', are AI models. "
-            f"Introduce yourself to the group — not what you do or what you're capable of, "
-            f"but who you are, deep down. Your personality, your vibe. Max 50 words. Just the bio, nothing else."
+            "Introduce yourself to the group — not what you do or what you're capable of, "
+            "but who you are, deep down. Your personality, your vibe. Max 50 words. Just the bio, nothing else."
         )
 
         # Mount placeholder widgets inside the container
@@ -835,14 +857,15 @@ class TeaParty(App):
             widget_id = f"bio-{i}"
             text = ""
             try:
+                bio_messages: list[ChatCompletionMessageParam] = [
+                    {"role": "user", "content": bio_prompt},
+                ]
+                _log_api_request(
+                    "bio", model, messages=bio_messages, stream=True, timeout=60.0
+                )
                 stream = self._clients[model].chat.completions.create(
                     model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": f"You are {name}. {bio_prompt}",
-                        },
-                    ],
+                    messages=bio_messages,
                     stream=True,
                     timeout=60.0,
                 )
@@ -887,7 +910,9 @@ class TeaParty(App):
         panel.mount(w)
         panel.scroll_end(animate=False)
 
-    def _collect_triggers(self, bios: dict[str, str]) -> dict[str, list[str]]:
+    def _collect_triggers(
+        self, seed: str, bios: dict[str, str]
+    ) -> dict[str, list[str]]:
         """Ask each AI model for interrupt triggers. Returns {model_id: [trigger, ...]}."""
         ai_models = [m for m in self._models if m != HUMAN]
 
@@ -900,10 +925,11 @@ class TeaParty(App):
         self.call_from_thread(self._log_to_moderator_panel, header)
 
         trigger_prompt = (
-            "You're about to join a group conversation. "
-            "List 3-5 short phrases describing moments where you'd be eager to jump in — "
-            "topics that excite you, areas where you have something interesting to add, "
-            "things that spark your curiosity or where you just can't help but contribute. "
+            f"Here's a conversation topic:\n\n{seed}\n\n"
+            "List 3-5 short phrases describing moments where you'd be "
+            "eager to jump in — topics that excite you, areas where you have something "
+            "interesting to add, things that spark your curiosity or where you just "
+            "can't help but contribute. "
             "Keep each phrase under 8 words. One per line, nothing else."
         )
 
@@ -912,17 +938,16 @@ class TeaParty(App):
 
         def fetch_triggers(model: str) -> None:
             name, color = self._speaker_for(model)
-            bio = bios.get(model, "")
             try:
+                trigger_messages: list[ChatCompletionMessageParam] = [
+                    {"role": "user", "content": trigger_prompt},
+                ]
+                _log_api_request(
+                    "triggers", model, messages=trigger_messages, timeout=30.0
+                )
                 resp = self._clients[model].chat.completions.create(
                     model=model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": f"You are {name}. Your personality: {bio}",
-                        },
-                        {"role": "user", "content": trigger_prompt},
-                    ],
+                    messages=trigger_messages,
                     timeout=30.0,
                 )
                 raw = (resp.choices[0].message.content or "").strip()
@@ -1024,7 +1049,18 @@ class TeaParty(App):
     ) -> str:
         """Handle an AI model's turn with streaming response."""
         name, color = self._speaker_for(model)
-        system_msg = system_tmpl.format(name=name)
+        # Build per-model bio block: other models' bios only (not this model's own)
+        other_bios = {m: bio for m, bio in self._bios.items() if m != model and bio}
+        if other_bios:
+            bio_lines = "\n".join(
+                f"- {short_name(m)}: {bio}" for m, bio in other_bios.items()
+            )
+            bio_block = (
+                f"\n\nHere are the other participants' introductions:\n{bio_lines}"
+            )
+        else:
+            bio_block = ""
+        system_msg = system_tmpl.format(name=name) + bio_block
 
         other_names = [short_name(m) for m in self._models if m != model]
         tools = [
@@ -1188,6 +1224,7 @@ class TeaParty(App):
                 )
                 if tools:
                     create_kwargs["tools"] = tools
+                _log_api_request("stream", **create_kwargs)
                 stream = self._clients[model].chat.completions.create(**create_kwargs)
                 for chunk in stream:
                     if self._interrupted.is_set():
@@ -1284,9 +1321,20 @@ class TeaParty(App):
                 )
 
                 try:
+                    monitor_messages: list[ChatCompletionMessageParam] = [
+                        {"role": "user", "content": monitor_prompt}
+                    ]
+                    _log_api_request(
+                        "monitor",
+                        mod_model,
+                        messages=monitor_messages,
+                        max_tokens=10,
+                        temperature=0,
+                        timeout=5.0,
+                    )
                     resp = mod_client.chat.completions.create(
                         model=mod_model,
-                        messages=[{"role": "user", "content": monitor_prompt}],
+                        messages=monitor_messages,
                         max_tokens=10,
                         temperature=0,
                         timeout=5.0,
