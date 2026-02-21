@@ -1,6 +1,6 @@
 # Tea Party
 
-A terminal application that drops multiple LLMs into a group conversation and lets them talk. You provide a seed prompt, and models take turns responding — chosen at random — until you stop them. You're also a participant.
+A terminal application that drops multiple LLMs into a group conversation and lets them talk. You provide a seed prompt, and models take turns responding — chosen at random — until you stop them. You can also be a participant (configurable).
 
 ## Quick Start
 
@@ -40,12 +40,15 @@ Create `config.json` (or `config.json5` — JSON5 is supported for comments):
   "moderator": {
     "url": "https://openrouter.ai/api/v1",
     "token": "sk-or-...",
-    "model": "meta-llama/llama-3.1-8b-instruct"
+    "model": "mistralai/mistral-small-3.2-24b-instruct"
   },
 
-  // Both default to true
-  "intros": true,
-  "interrupts": true
+  // All optional, shown with defaults:
+  "intros": true,           // collect personality bios before conversation
+  "interrupts": true,       // enable interrupt triggers and monitoring (requires moderator)
+  "human_speaker": true,    // whether you participate as a speaker (false = observe only)
+  "interrupt_threshold": 8, // 1–10 score above which a trigger fires an interrupt
+  "max_triggers": 5         // max interrupt triggers per model (oldest dropped when exceeded)
 }
 ```
 
@@ -58,7 +61,7 @@ chmod +x tea_party.py
 ./tea_party.py
 ```
 
-The `providers` array is **required** and must contain at least one provider with at least one model. Model IDs must be unique across all providers. The human participant (`you`) is always appended automatically — don't add `"human"` to any model list.
+The `providers` array is **required** and must contain at least one provider with at least one model. Model IDs must be unique across all providers. When `human_speaker` is `true` (the default), you are appended as a participant — don't add `"human"` to any model list.
 
 ## Files
 
@@ -67,7 +70,7 @@ The `providers` array is **required** and must contain at least one provider wit
 | `tea_party.py` | The entire application — single file |
 | `config.json` / `config.json5` | User configuration (providers, models, moderator) |
 | `config.schema.json` | JSON Schema for the config file (draft 2020-12) |
-| `tea_party.log` | API request log (recreated each run) |
+| `moderation.log` | Moderator activity + full message transcript (recreated each run) |
 
 ## Architecture
 
@@ -92,8 +95,8 @@ Textual manages these docked regions:
 ┌────────────────────────────────────┬────────────────────┐
 │  VerticalScroll #chat              │  #moderator-panel   │
 │    Static .model-list              │  (hidden by default)│
-│    Vertical #bio-container         │  Mod trigger checks │
-│    Static .message (one per turn)  │  and decisions       │
+│    Vertical #bio-container         │  Trigger checks,    │
+│    Static .message (one per turn)  │  scores, decisions  │
 │    ...                             │                     │
 ├────────────────────────────────────┴────────────────────┤
 │  ChatInput (multi-line TextArea, when your turn)        │
@@ -104,7 +107,7 @@ Textual manages these docked regions:
 └─────────────────────────────────────────────────────────┘
 ```
 
-On startup, a `ChatInput #seed-input` is shown for the seed prompt. It's removed after submission and the pre-conversation phases (bios, triggers) begin.
+On startup, a `ChatInput #seed-input` is shown for the seed prompt. It's removed after submission and the pre-conversation phase (bios) begins.
 
 `ChatInput` is a `TextArea` subclass that supports multi-line editing with soft wrapping, auto-grows vertically (up to 14 lines), and submits on Enter.
 
@@ -122,17 +125,13 @@ There are three `threading.Event` objects for cross-thread coordination:
 
 A `threading.Condition` (`_speed_cond`) coordinates speed changes and interrupt wakeups for the consumer loop.
 
-### Pre-Conversation Phases
+### Pre-Conversation Phase
 
-Before the main conversation loop, up to two optional setup phases run:
+Before the main conversation loop, an optional setup phase runs:
 
-**1. Introductions** (`_collect_bios`, enabled by `"intros": true`)
+**Introductions** (`_collect_bios`, enabled by `"intros": true`)
 
-Each AI model streams a short personality bio in parallel. The human also enters a bio via `ChatInput`. Results are displayed in a bordered "Introductions" container. During the conversation, each model's system prompt includes other participants' bios (but not its own).
-
-**2. Interrupt Triggers** (`_collect_triggers`, enabled by `"interrupts": true`, requires a moderator)
-
-Each AI model provides 3–5 short phrases describing moments where it would want to jump in. These are collected in parallel (non-streaming) and logged to the moderator panel. If intros are also enabled, triggers are shown appended to each model's bio widget.
+Each AI model streams a short personality bio in parallel. If the human is a speaker, they also enter a bio via `ChatInput`. Results are displayed in a bordered "Introductions" container. During the conversation, each model's system prompt includes other participants' bios (but not its own).
 
 ### Conversation Loop (`_run_conversation`)
 
@@ -159,12 +158,13 @@ A word-limit directive is appended to the last message in the conversation, enfo
 
 ### Tools
 
-Each AI model has two tools available:
+Each AI model has these tools available:
 
 | Tool | Effect |
 |---|---|
-| `request_next_speaker` | Sets `_next_override` so a specific participant speaks next. Useful when a model asks someone a direct question. |
+| `request_next_speaker` | The primary turn-management tool. Sets `_next_override` so a specific participant speaks next. Models are encouraged to use this liberally — whenever they mention someone, ask a question, or want a specific person's take. |
 | `skip` | Passes the turn. The message shows "(passed)" instead of content. |
+| `set_triggers` | Optional. Replaces all of the model's interrupt triggers at once. Takes an array of 0–`max_triggers` short phrases describing specific things that would compel an interrupt (wrong claims, dangerous misconceptions, strong disagreements). Passing an empty array clears all triggers. Models don't have to set any, and are told to clear them when no longer relevant. Interrupts are framed as disruptive — `request_next_speaker` is almost always the better choice. Only available when interrupts are enabled and a moderator is configured. |
 
 Tool calls are extracted from the streaming response and processed after the stream completes.
 
@@ -176,8 +176,9 @@ Each model gets a tailored system prompt that tells it:
 - To be concise and conversational
 - NOT to prefix responses with its name (the UI does that)
 - That interrupted messages are normal (cut off by the moderator)
-- How to use `request_next_speaker` and `skip` tools
+- How to use `request_next_speaker`, `skip`, and `set_triggers` tools
 - Other participants' bios (excluding its own)
+- Its current interrupt triggers (if any are set)
 
 ### Token Buffer & Speed Control (`_stream`)
 
@@ -209,15 +210,35 @@ Speed control keys are currently disabled in the UI; `_tps` defaults to `None` (
 
 ### Moderator & Interrupt Monitor
 
-When a moderator model is configured and interrupt triggers have been collected, a **monitor thread** runs alongside each AI turn's stream. It periodically checks the rendered text against other participants' triggers by sending a short prompt to the moderator model:
+When a moderator model is configured and interrupts are enabled, a **monitor thread** runs alongside each AI turn's stream. Models register interrupt triggers dynamically during conversation using the `set_triggers` tool — there is no upfront trigger collection phase. The monitor checks rendered text against other participants' registered triggers:
 
 - Waits for at least 80 new characters and 1.5 seconds between checks
 - Looks for sentence boundaries before checking (to avoid partial-sentence false positives)
-- Sends the last ~300 characters of rendered text plus a list of all other participants' triggers
-- The moderator replies with either a participant name or "NONE"
-- If a participant is named, the monitor interrupts the current speaker and sets that participant as next speaker
+- Rebuilds its trigger snapshot each cycle so newly registered triggers are picked up immediately
+- If no triggers exist yet (no model has called `set_triggers`), the cycle is skipped
+- Sends the last ~300 characters of rendered text to the moderator model
+- The moderator uses a **forced tool call** (`score_triggers`) returning a structured object with one entry per participant, each containing an integer score (1–10) and a brief rationale
+- If any participant's score meets or exceeds `interrupt_threshold` (default 8), the monitor interrupts the current speaker and sets that participant as next speaker
+- If multiple participants score above threshold, one is chosen at random
 
-All moderator activity is logged to the moderator side panel (toggle with Ctrl+M).
+The **scoring scale** described to the moderator uses every integer 1–10 with explicit anchors (e.g. 2 = vaguely same domain, 4 = topic overlap but nothing specific, 7 = close paraphrase, 9 = nearly verbatim). The prompt explicitly discourages rounding to attractor values.
+
+Moderator activity (checks, scores, rationales, interrupt decisions) is logged to the moderator side panel (toggle with Ctrl+M). The same information plus full message transcripts is written to `moderation.log` for post-conversation analysis.
+
+### Moderation Log
+
+`moderation.log` is recreated each run and captures everything needed to analyze interrupt system behavior:
+
+- The conversation topic
+- Turn metadata (speaker, selection reason)
+- Monitor checks with scored snippets, per-participant scores, and rationales
+- Trigger updates (full replacement sets, clears)
+- Tool calls (`request_next_speaker`, `skip`, `set_triggers`)
+- Turn outcomes (finished, interrupted, passed)
+- Full message text for every turn
+- Moderator interrupt notes
+
+The TUI's moderator panel shows a subset of this (structural metadata, scores, outcomes) without the full message text, which is already visible in the chat.
 
 ### Rewind Mode
 
@@ -249,7 +270,7 @@ Enter and the word-limit keys are handled in `on_key` (not as `Binding`s) so the
 
 A 1-line `StatusBar` widget docked to the bottom:
 
-State (`✏️ enter seed prompt` / `🪪 generating bios…` / `🎯 collecting triggers…` / `💬 model-name` / `▶ running`) │ Next (`🎲 next → random` / `🎯 next → model-name` / `⏪ rewind`) │ Turn count with hold indicator (`turn N ✋` or `turn N ▶`) │ Word limit (`📏 unlimited` / `📏 ≤50w`)
+State (`✏️ enter seed prompt` / `🪪 generating bios…` / `💬 model-name` / `▶ running`) │ Next (`🎲 next → random` / `🎯 next → model-name` / `⏪ rewind`) │ Turn count with hold indicator (`turn N ✋` or `turn N ▶`) │ Word limit (`📏 unlimited` / `📏 ≤50w`)
 
 ### Model Colors
 
@@ -263,15 +284,11 @@ Each model gets a color from `MODEL_COLORS` (indexed by position, wraps with mod
 ### Error Handling
 
 - API errors (non-200, network failures, timeouts) are caught in `_stream` and displayed inline as a red error message in the chat. The conversation continues — it doesn't crash.
-- `action_quit_app` unblocks all waiting threads (`_interrupted`, `_pause_gate`, `_human_ready`) before calling `self.exit()` so the worker thread can terminate cleanly without tracebacks.
+- `action_quit_app` unblocks all waiting threads (`_interrupted`, `_pause_gate`, `_human_ready`) and closes `moderation.log` before calling `self.exit()` so the worker thread can terminate cleanly without tracebacks.
 - Missing config or providers is caught at startup with a clear message.
 
 ### Config Loading
 
 `_load_config()` checks for `config.json5` first, then `config.json`, in the same directory as the script. Parsed with `json5.load()` (which also handles standard JSON). If neither file exists, it falls back to an empty dict and the missing-providers check fails with a message.
 
-The `HUMAN` entry is always appended as the last participant after all provider models are loaded.
-
-### API Logging
-
-Every API request (bios, triggers, monitor checks, conversation streams) is logged to `tea_party.log` in the application directory. The log is recreated on each run and includes timestamps and full request bodies formatted as JSON.
+When `human_speaker` is `true` (the default), `HUMAN` is appended as the last participant after all provider models are loaded. When `false`, no bio is collected for the human and they do not take turns — the conversation runs fully autonomously.

@@ -64,6 +64,9 @@ WORD_LIMITS: list[int] = [10, 25, 50, 100, 200, 500]
 # Interrupt monitor: default score threshold (1–10 integer scale) above which a trigger fires
 DEFAULT_INTERRUPT_THRESHOLD: int = 8
 
+# Maximum number of interrupt triggers a model can hold at once (FIFO eviction)
+DEFAULT_MAX_TRIGGERS: int = 5
+
 
 # ── Data types ────────────────────────────────────────────────────────────────
 
@@ -84,6 +87,7 @@ class AppConfig(NamedTuple):
     interrupts: bool  # collect interrupt triggers (requires moderator)
     human_speaker: bool  # whether the human participates as a speaker
     interrupt_threshold: int  # 1–10 score above which a trigger fires
+    max_triggers: int  # max triggers per model (FIFO eviction)
 
 
 # ── Pure helpers ──────────────────────────────────────────────────────────────
@@ -286,6 +290,7 @@ class TeaParty(App):
         self._intros_enabled: bool = config.intros
         self._interrupts_enabled: bool = config.interrupts
         self._interrupt_threshold: int = config.interrupt_threshold
+        self._max_triggers: int = config.max_triggers
         self._mod_log_file = open(
             CONFIG_DIR / "moderation.log", "w", encoding="utf-8", buffering=1
         )
@@ -312,6 +317,7 @@ class TeaParty(App):
         self._was_paused_before_rewind: bool = True
         self._bios: dict[str, str] = {}
         self._interrupt_triggers: dict[str, list[str]] = {}
+        self._trigger_lock: threading.Lock = threading.Lock()
         self._model_interrupted_by: str | None = None
 
     # ── Model helpers ─────────────────────────────────────────────
@@ -716,12 +722,6 @@ class TeaParty(App):
             if worker.is_cancelled:
                 return
 
-        # 2. Collect interrupt triggers (models see the seed + their own bio, but not others' bios)
-        if self._interrupts_enabled and self._moderator_model:
-            self._interrupt_triggers = self._collect_triggers(seed, bios)
-            if worker.is_cancelled:
-                return
-
         # 3. Conversation starts — models see seed + participant list
         #    (bios are injected per-model in _handle_ai_turn, excluding self)
         self._bios = bios
@@ -771,11 +771,19 @@ class TeaParty(App):
             "The 'moderator' is the system managing this conversation — it is not a participant. "
             "It handles turn order, reports interrupts, and may issue directives (e.g. word limits). "
             "Follow its directives.\n\n"
-            "You have two tools available:\n"
-            "- request_next_speaker: if you mention someone by name or want their input, "
-            "call this tool so they actually speak next. Without it, speaker order is random "
-            "and they may not get the chance to respond.\n"
-            "- skip: call this to pass on your turn if you have nothing to add."
+            "TOOLS:\n"
+            "- request_next_speaker: YOUR PRIMARY TOOL for directing the conversation. "
+            "Whenever you mention someone, ask them a question, or want to hear their take, "
+            "call this so they actually speak next. Without it, the next speaker is random "
+            "and they may never get to respond to you. Use this liberally.\n"
+            "- skip: pass on your turn if you have nothing to add right now.\n"
+            "- set_triggers: optionally set interrupt triggers — things that, if someone says them, "
+            "will cause you to interrupt mid-sentence and take the mic. Pass an array of "
+            f"0–{self._max_triggers} short phrases (under 8 words each). These should be reserved "
+            "for things you truly can't let slide — specific wrong claims, dangerous misconceptions, "
+            "or strong disagreements. Passing an empty array clears your triggers. "
+            "You don't have to set any triggers, and you should clear them when they're no longer relevant. "
+            "Interrupts are disruptive — request_next_speaker is almost always the better choice."
         )
 
         while not worker.is_cancelled:
@@ -955,101 +963,6 @@ class TeaParty(App):
         if self._mod_log_file and not self._mod_log_file.closed:
             self._mod_log_file.write(entry.plain + "\n")
 
-    def _collect_triggers(
-        self, seed: str, bios: dict[str, str]
-    ) -> dict[str, list[str]]:
-        """Ask each AI model for interrupt triggers. Returns {model_id: [trigger, ...]}."""
-        ai_models = [m for m in self._models if m != HUMAN]
-
-        self._setup_status = "🎯 collecting triggers…"
-        self.call_from_thread(self._refresh_status)
-
-        # Log header to moderator panel
-        header = Text()
-        header.append("── collecting triggers ──", style="dim bold")
-        self.call_from_thread(self._log_to_moderator_panel, header)
-
-        trigger_prompt = (
-            f"Here's a conversation topic:\n\n{seed}\n\n"
-            "List 3-5 short phrases describing specific moments where you'd feel "
-            "compelled to interrupt someone mid-sentence — not broad topics you enjoy, "
-            "but particular things someone might say that you couldn't let pass. "
-            "Think: someone says something wrong you need to correct, makes a claim "
-            "you strongly disagree with, or touches a very specific nerve where you "
-            "have something concrete and urgent to add.\n"
-            "Keep each phrase under 8 words. One per line, nothing else."
-        )
-
-        triggers: dict[str, list[str]] = {}
-        lock = threading.Lock()
-
-        def fetch_triggers(model: str) -> None:
-            name, color = self._speaker_for(model)
-            try:
-                trigger_messages: list[ChatCompletionMessageParam] = [
-                    {"role": "user", "content": trigger_prompt},
-                ]
-                resp = self._clients[model].chat.completions.create(
-                    model=model,
-                    messages=trigger_messages,
-                    timeout=30.0,
-                )
-                raw = (resp.choices[0].message.content or "").strip()
-                # Parse lines, strip bullets/numbers
-                lines = []
-                for line in raw.splitlines():
-                    line = line.strip()
-                    line = line.lstrip("0123456789.-•*) ").strip()
-                    if line:
-                        lines.append(line)
-                parsed = lines[:5]
-                with lock:
-                    triggers[model] = parsed
-                # Log to moderator panel
-                entry = Text()
-                entry.append(f"[{name}] ", style=f"bold {color}")
-                if parsed:
-                    entry.append(" · ".join(parsed), style="dim")
-                else:
-                    entry.append("(none)", style="dim italic")
-                self.call_from_thread(self._log_to_moderator_panel, entry)
-            except Exception as exc:
-                logger.warning("Failed to collect triggers from %s: %s", name, exc)
-                with lock:
-                    triggers[model] = []
-                entry = Text()
-                entry.append(f"[{name}] ", style=f"bold {color}")
-                entry.append(f"error: {exc}", style="dim red")
-                self.call_from_thread(self._log_to_moderator_panel, entry)
-
-        threads = [
-            threading.Thread(target=fetch_triggers, args=(m,), daemon=True)
-            for m in ai_models
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        # Update bio widgets to show triggers (only if intros were collected)
-        if self._intros_enabled:
-            for i, model in enumerate(ai_models):
-                model_triggers = triggers.get(model, [])
-                if model_triggers:
-                    name, color = self._speaker_for(model)
-                    bio_text = bios.get(model, "")
-                    trigger_line = " · ".join(model_triggers)
-                    t = _prefixed_text(name, color, bio_text)
-                    t.append(
-                        f"\n  ↳ interrupts when: {trigger_line}", style="dim italic"
-                    )
-                    self.call_from_thread(self._update_message, f"bio-{i}", t)
-
-        self._setup_status = None
-        self.call_from_thread(self._refresh_status)
-
-        return triggers
-
     def _handle_human_turn(
         self,
         worker: Worker,
@@ -1121,7 +1034,7 @@ class TeaParty(App):
         system_msg = system_tmpl.format(name=name) + bio_block
 
         other_names = [short_name(m) for m in self._models if m != model]
-        tools = [
+        tools: list[dict] = [
             {
                 "type": "function",
                 "function": {
@@ -1153,6 +1066,54 @@ class TeaParty(App):
                 },
             },
         ]
+
+        if self._interrupts_enabled and self._moderator_model:
+            # Show current triggers in system message so model knows what it has
+            with self._trigger_lock:
+                current = list(self._interrupt_triggers.get(model, []))
+            if current:
+                trigger_block = (
+                    f"\n\nYour current interrupt triggers ({len(current)}/{self._max_triggers}): "
+                    + ", ".join(f'"{t}"' for t in current)
+                )
+            else:
+                trigger_block = (
+                    "\n\nYou have no interrupt triggers set. If there's something specific "
+                    "you couldn't let slide, you can use set_triggers — but it's optional."
+                )
+            system_msg += trigger_block
+
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "set_triggers",
+                        "description": (
+                            f"Replace ALL your interrupt triggers. Pass an array of 0–{self._max_triggers} "
+                            f"short phrases (each under 8 words). Each phrase should describe something "
+                            f"specific that, if another participant says it, would compel you to interrupt — "
+                            f"a wrong claim, a misconception, a concrete topic you must respond to. "
+                            f"Pass an empty array to clear all triggers. Update when the conversation "
+                            f"shifts or your interests change."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "triggers": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "maxItems": self._max_triggers,
+                                    "description": (
+                                        f"Array of 0–{self._max_triggers} trigger phrases. "
+                                        f"Each under 8 words. Replaces all existing triggers."
+                                    ),
+                                }
+                            },
+                            "required": ["triggers"],
+                        },
+                    },
+                }
+            )
 
         full_messages: list[dict[str, object]] = [
             {"role": "system", "content": system_msg}
@@ -1233,6 +1194,32 @@ class TeaParty(App):
                 tc_entry = Text()
                 tc_entry.append("  tool: ", style="dim")
                 tc_entry.append(f"request_next_speaker({participant})", style="italic")
+                self.call_from_thread(self._log_to_moderator_panel, tc_entry)
+            elif tc["name"] == "set_triggers":
+                try:
+                    args = json.loads(tc["arguments"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                raw_triggers = args.get("triggers", [])
+                if not isinstance(raw_triggers, list):
+                    continue
+                # Clean and cap
+                new_triggers = [
+                    t.strip() for t in raw_triggers if isinstance(t, str) and t.strip()
+                ][: self._max_triggers]
+                with self._trigger_lock:
+                    self._interrupt_triggers[model] = new_triggers
+                tc_entry = Text()
+                tc_entry.append(f"  triggers ({name}): ", style="dim")
+                if new_triggers:
+                    tc_entry.append(
+                        " · ".join(f'"{t}"' for t in new_triggers), style="italic green"
+                    )
+                else:
+                    tc_entry.append("(cleared)", style="dim italic")
+                tc_entry.append(
+                    f" ({len(new_triggers)}/{self._max_triggers})", style="dim"
+                )
                 self.call_from_thread(self._log_to_moderator_panel, tc_entry)
             elif tc["name"] == "skip":
                 skipped = True
@@ -1381,71 +1368,93 @@ class TeaParty(App):
         def monitor() -> None:
             """Watch rendered text for interrupt-trigger matches via the moderator model."""
             assert mod_client is not None and mod_model is not None
-            other_triggers = {
-                m: trigs
-                for m, trigs in self._interrupt_triggers.items()
-                if m != model and trigs
-            }
-            if not other_triggers:
-                skip_entry = Text()
-                skip_entry.append("  monitor: ", style="dim")
-                skip_entry.append("skipped (no other triggers)", style="dim italic")
-                self.call_from_thread(self._log_to_moderator_panel, skip_entry)
-                return
 
-            # Build the score_triggers tool: one numeric property per participant,
-            # with their triggers baked into the description.
-            score_properties: dict[str, object] = {}
-            participant_keys: list[str] = []  # sanitised keys in order
-            key_to_model: dict[str, str] = {}  # sanitised key -> model id
-            key_to_name: dict[str, str] = {}  # sanitised key -> short display name
-            for m, trigs in other_triggers.items():
-                sname = short_name(m)
-                key = _api_name(sname)  # safe for JSON property names
-                participant_keys.append(key)
-                key_to_model[key] = m
-                key_to_name[key] = sname
-                score_properties[key] = {
-                    "type": "object",
-                    "properties": {
-                        "score": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": 10,
-                            "description": (
-                                f"1–10: how strongly the current text matches "
-                                f"{sname}'s interrupt triggers: {', '.join(trigs)}. "
-                                f"1 = no relevance at all. 5 = same general topic but no specific trigger matched. "
-                                f"8 = a trigger is closely paraphrased. 10 = a trigger is stated almost verbatim. "
-                                f"Use the full range. Most scores should be 1–4."
-                            ),
-                        },
-                        "rationale": {
-                            "type": "string",
-                            "description": "Very brief reason for this score (max 10 words)",
-                        },
-                    },
-                    "required": ["score", "rationale"],
-                }
+            def _build_score_tool() -> (
+                tuple[dict, list[str], dict[str, str], dict[str, str]] | None
+            ):
+                """Snapshot current triggers and build the score_triggers tool.
 
-            score_tool = {
-                "type": "function",
-                "function": {
-                    "name": "score_triggers",
-                    "description": (
-                        "Score how strongly the current speaker's text matches "
-                        "each participant's interrupt triggers on a 1–10 integer scale. "
-                        "1 = no relevance. 5 = same broad topic. 8+ = specific trigger closely matched. "
-                        "Merely mentioning a topic is NOT a match — the speaker must say something "
-                        "that closely echoes the specific claim in a trigger. Use the full range."
-                    ),
-                    "parameters": {
+                Returns (tool, keys, key→model, key→name) or None if no triggers.
+                """
+                with self._trigger_lock:
+                    other_triggers = {
+                        m: list(trigs)
+                        for m, trigs in self._interrupt_triggers.items()
+                        if m != model and trigs
+                    }
+                if not other_triggers:
+                    return None
+
+                props: dict[str, object] = {}
+                keys: list[str] = []
+                k2m: dict[str, str] = {}
+                k2n: dict[str, str] = {}
+                for m, trigs in other_triggers.items():
+                    sname = short_name(m)
+                    key = _api_name(sname)
+                    keys.append(key)
+                    k2m[key] = m
+                    k2n[key] = sname
+                    props[key] = {
                         "type": "object",
-                        "properties": score_properties,
-                        "required": participant_keys,
+                        "properties": {
+                            "score": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10,
+                                "description": (
+                                    f"1–10: how strongly the current text matches "
+                                    f"{sname}'s interrupt triggers: {', '.join(trigs)}. "
+                                    f"Think step by step before scoring. Ask yourself: "
+                                    f"does the speaker's text SPECIFICALLY match one of {sname}'s triggers, "
+                                    f"or merely discuss the same broad subject? "
+                                    f"1 = completely unrelated. "
+                                    f"2 = vaguely same domain. "
+                                    f"3 = same broad topic area. "
+                                    f"4 = topic overlap with a trigger but nothing specific. "
+                                    f"5 = discusses the same subject as a trigger. "
+                                    f"6 = makes a claim in the neighborhood of a trigger. "
+                                    f"7 = close paraphrase of a trigger's claim. "
+                                    f"8 = strongly echoes a specific trigger. "
+                                    f"9 = nearly verbatim match to a trigger. "
+                                    f"10 = exact trigger statement. "
+                                    f"Do NOT round to 0, 5, 8, or 10. Use every value."
+                                ),
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": (
+                                    "Your reasoning: which trigger (if any) is closest, "
+                                    "what the speaker actually said, and why you chose this score. "
+                                    "Be specific — do not just say 'no match' or 'matches trigger'."
+                                ),
+                            },
+                        },
+                        "required": ["score", "rationale"],
+                    }
+
+                tool = {
+                    "type": "function",
+                    "function": {
+                        "name": "score_triggers",
+                        "description": (
+                            "Score how strongly the current speaker's text matches "
+                            "each participant's interrupt triggers on a 1–10 integer scale. "
+                            "Think carefully about each score. A score of 5 means 'same topic "
+                            "but no specific trigger matched' — that is NOT an interrupt. "
+                            "Only 8+ should trigger an interrupt, meaning the speaker closely "
+                            "echoed or stated something a trigger specifically describes. "
+                            "Merely mentioning a topic that a trigger also mentions is a 3–5, NOT an 8. "
+                            "Use the full 1–10 range. Scores of 2, 3, 4, 6, 7 are valid and expected."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": props,
+                            "required": keys,
+                        },
                     },
-                },
-            }
+                }
+                return tool, keys, k2m, k2n
 
             last_checked_len = 0
             min_new_chars = 80  # wait for enough new content
@@ -1453,7 +1462,7 @@ class TeaParty(App):
             last_check_time = 0.0
             check_count = 0
 
-            # Log monitor start (triggers already shown at collection time)
+            # Log monitor start
             start_entry = Text()
             start_entry.append("  monitor: ", style="dim")
             start_entry.append("watching", style="dim italic")
@@ -1477,6 +1486,13 @@ class TeaParty(App):
                 if not has_boundary and new_len < 200:
                     continue
 
+                # Rebuild tool each cycle to pick up newly registered triggers
+                built = _build_score_tool()
+                if built is None:
+                    # No triggers registered yet — skip this cycle
+                    continue
+                score_tool, participant_keys, key_to_model, key_to_name = built
+
                 last_checked_len = len(text)
                 last_check_time = now_mono
                 check_count += 1
@@ -1492,7 +1508,11 @@ class TeaParty(App):
                     f"You are monitoring a group conversation for interrupt triggers.\n"
                     f"Current speaker: {name}\n\n"
                     f'Recent text from {name}:\n"{context}"\n\n'
-                    f"Use the score_triggers tool to rate each participant."
+                    f"Score each participant's triggers against this text. Think carefully:\n"
+                    f"- Does the text SPECIFICALLY match a trigger, or just discuss the same area?\n"
+                    f"- Mentioning a topic is NOT the same as making the specific claim in a trigger.\n"
+                    f"- Use the full 1–10 range. Most scores should be 1–5. Only score 8+ for close matches.\n"
+                    f"- In your rationale, name the closest trigger and explain what the speaker actually said.\n"
                 )
 
                 try:
@@ -1610,7 +1630,7 @@ class TeaParty(App):
                 self.call_from_thread(self._log_to_moderator_panel, end_entry)
 
         monitor_thread: threading.Thread | None = None
-        if mod_client and mod_model and self._interrupt_triggers:
+        if mod_client and mod_model and self._interrupts_enabled:
             monitor_thread = threading.Thread(target=monitor, daemon=True)
             monitor_thread.start()
 
@@ -1749,6 +1769,7 @@ def main() -> None:
     interrupt_threshold = int(
         raw.get("interrupt_threshold", DEFAULT_INTERRUPT_THRESHOLD)
     )
+    max_triggers = int(raw.get("max_triggers", DEFAULT_MAX_TRIGGERS))
 
     app = TeaParty(
         AppConfig(
@@ -1760,6 +1781,7 @@ def main() -> None:
             interrupts=interrupts_enabled,
             human_speaker=human_speaker,
             interrupt_threshold=interrupt_threshold,
+            max_triggers=max_triggers,
         )
     )
     try:
