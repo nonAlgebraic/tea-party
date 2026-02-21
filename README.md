@@ -159,12 +159,12 @@ Runs in the worker thread. Infinite loop:
 Each AI model sees the conversation from its own point of view:
 
 - Its own previous messages → `role: "assistant"`
-- Everyone else's messages (other AIs, the human, the seed) → `role: "user"` with a `name` field
+- Everyone else's messages (other AIs and the human) → `role: "user"` with a `name` field. The seed/intro is included as a `user` message without a `name`.
 - A `system` message telling it who it is, who the other participants are, behavioral guidance, and other participants' bios
 
 Consecutive same-role messages from the same speaker are merged (concatenated with `\n\n`) to satisfy providers that reject adjacent messages with the same role. If the conversation ends with an assistant message, a synthetic user message is appended.
 
-A word-limit directive is appended to the last message in the conversation, enforcing the current `_max_words` setting.
+A word-limit directive is appended only after you've adjusted the word limit at least once, and it reflects the current `_max_words` setting.
 
 ### Tools
 
@@ -259,7 +259,7 @@ Pressing Ctrl+Z enters rewind mode (only available when no one is speaking and a
 - Enter commits: all messages after the selected point are removed from both the UI and history
 - Escape cancels and restores the previous pause state
 
-After committing a rewind, the conversation resumes from the truncated point.
+After committing a rewind, the conversation resumes from the truncated point only if it wasn't paused before entering rewind; otherwise it stays paused.
 
 ### Key Bindings
 
@@ -274,7 +274,7 @@ After committing a rewind, the conversation resumes from the truncated point.
 | `ctrl+m` | Moderator panel | Toggles the side panel showing moderator activity |
 | `ctrl+q` | Quit | |
 
-Enter and the word-limit keys are handled in `on_key` (not as `Binding`s) so they can be context-sensitive — they yield to `ChatInput` when one is focused and have special behavior in rewind mode.
+Enter is handled in `on_key` (not as a `Binding`) so it can be context-sensitive — it yields to `ChatInput` when one is focused and has special behavior in rewind mode. The word-limit keys are `Binding`s.
 
 ### Status Bar
 
