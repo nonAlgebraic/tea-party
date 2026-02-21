@@ -17,6 +17,11 @@
       "default": true,
       "description": "Whether to collect interrupt triggers from each model (requires a moderator to be configured). Defaults to true."
     },
+    "human_speaker": {
+      "type": "boolean",
+      "default": true,
+      "description": "Whether the human participates as a speaker in the conversation. When false, the human only observes and controls the session. Defaults to true."
+    },
     "moderator": {
       "type": "object",
       "description": "A fast, cheap model that watches the conversation stream and decides when another participant should interrupt the current speaker. Each participant declares 'interrupt triggers' at the start; the moderator watches for matches in real time.",
