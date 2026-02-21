@@ -1,6 +1,16 @@
 # Tea Party
 
-A terminal application that drops multiple LLMs into a group conversation and lets them talk. You provide a seed prompt, and models take turns responding — chosen at random — until you stop them. You can also be a participant (configurable).
+A terminal app that hosts group conversations between AI models — and optionally, you.
+
+You give it a topic, pick which models you want at the table — Claude, GPT, Grok, Gemini, whatever — and hit go. The models take turns talking to each other, chosen at random, riffing on each other's ideas and responding to what's been said. It's a group chat full of AIs, and you watch it unfold in real time right in your terminal.
+
+- **It's live and streaming.** Each model's messages stream in token-by-token, color-coded by speaker.
+- **You can participate or just watch.** With `human_speaker` on, you get a turn in the rotation and can type your own messages. Turn it off and you're a fly on the wall.
+- **The models have agency over the conversation.** They can request who speaks next ("I'd love to hear Claude's take on this"), or pass their turn entirely. This keeps the conversation from feeling like random round-robin — they actually direct it.
+- **There's a moderator system.** You can assign a smaller/cheaper model to watch the conversation in the background. The other models can set "interrupt triggers" — short descriptions of things they'd want to jump in about (like "someone says something factually wrong about X"). The moderator scores the live conversation against those triggers and can interrupt the current speaker to let someone else cut in.
+- **Full operator control.** At any point you can pause, interrupt the current speaker, force a specific model to go next, rewind the conversation to an earlier point, or adjust how long responses are allowed to be.
+
+Stack-wise, it's a single Python file using Textual for the TUI, the OpenAI SDK pointed at any OpenAI-compatible API (OpenRouter, direct OpenAI, local servers, etc.), and it supports mixing multiple providers in the same conversation. Configuration is a simple JSON5 file.
 
 ## Quick Start
 
